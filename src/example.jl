@@ -193,13 +193,58 @@ integ = init(prob, RushLarsen(), dt = 0.01)
 
 @allocated step!(integ)
 
+@btime 
 
-@profview_allocs begin
-    sol = solve(prob, RushLarsen(), dt = 0.01);
-end sample_rate = 1.0
+@profview for i in 1:10000000 step!(integ) end
+
+@btime sol = solve(prob, RushLarsen(), dt = 0.01);
 
 plot_simulation(sol)
 
+
+function hodgkin_huxley_iip(du,u, p, t)
+    V, n, m, h = u
+    gNa, gK, gL, ENa, EK, EL, C = p
+
+    # Get alpha and beta values from the rate functions
+    alpha_n_val, beta_n_val = n_rates(V)
+    alpha_m_val, beta_m_val = m_rates(V)
+    alpha_h_val, beta_h_val = h_rates(V)
+
+    # Compute ionic currents
+    INa = gNa * m^3 * h * (V - ENa)
+    IK = gK * n^4 * (V - EK)
+    IL = gL * (V - EL)
+
+    # Compute derivatives
+    du[1] = -(INa + IK + IL) / C  # dV/dt
+    du[2] = alpha_n_val * (1 - n) - beta_n_val * n  # dn/dt
+    du[3] = alpha_m_val * (1 - m) - beta_m_val * m  # dm/dt
+    du[4] = alpha_h_val * (1 - h) - beta_h_val * h  # dh/dt
+end
+
+function hh_with_stimulus_iip(du, u, p, t)
+    I_ext = 10.0
+    hodgkin_huxley_iip(du, u, p, t)
+    du[1] = du[1] + I_ext / p[7]  # Add external current to dV/dt
+end
+
+p = [120.0, 36.0, 0.3, 50.0, -77.0, -54.4, 1.0]
+
+# Initial conditions: V, n, m, h
+u0 = [-65.0, 0.317, 0.05, 0.6]
+
+tspan = (0.0, 50.0)
+
+prob = ODEProblem(hh_with_stimulus_iip, u0, tspan, p)
+
+reg_int = init(prob, SimpleEuler(), dt = 0.01)
+
+@btime step!(reg_int)
+
+@profview_allocs step!(reg_int) sample_rate = 1.0
+
+@btime solve(prob, SimpleEuler(), dt=0.01);
 
 
 function plot_simulation(sol)

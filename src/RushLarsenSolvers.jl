@@ -5,10 +5,14 @@ module RushLarsenSolvers
     using LinearAlgebra
     using Parameters
     using ConcreteStructs
+    using OrdinaryDiffEq
 
     abstract type AbstractRushLarsenAlgorithm <: SciMLBase.AbstractODEAlgorithm end
 
     include("simple.jl")
-# Write your package code here.
+    include("generalized_rl.jl")
+
+    export RushLarsen, RushLarsenFunction
+    export GeneralizedRushLarsen
 
 end
