@@ -29,7 +29,13 @@ end
 @inline function rushlarsen_init(f::F, IIP::Bool, u0::S, t0::T, dt::T,
     p::P) where
 {F,P,T,S}
-    gating_vars_prototype = fill(ntuple(_ -> zero(eltype(u0)),2), length(f.f.gating_idxs))
+
+    if f isa RushLarsenFunction
+        rl_f = f
+    else
+        rl_f = f.f
+    end
+    gating_vars_prototype = fill(ntuple(_ -> zero(eltype(u0)),2), length(rl_f.gating_idxs))
     integ = RushLarsenIntegrator{IIP,S,T,P,F,typeof(gating_vars_prototype)}(f,
         copy(u0),
         copy(u0),
@@ -55,10 +61,15 @@ end
 
     @unpack tmp, f, p, t, dt, uprev, u, prev_gating_vars, gating_vars = integ
 
+    if f isa RushLarsenFunction
+        rl_f = f
+    else
+        rl_f = f.f
+    end
 
-    f.f.gating_f(gating_vars, u, p, t)
+    rl_f.gating_f(gating_vars, u, p, t)
 
-    for (i, k) in enumerate(f.f.gating_idxs)
+    for (i, k) in enumerate(rl_f.gating_idxs)
         alpha_i = gating_vars[i][1]
         beta_i = gating_vars[i][2]
         # Rush-Larsen formula: u_new = u_inf + (u_old - u_inf) * exp(-dt/tau)
@@ -77,9 +88,9 @@ end
 
     # Use Euler for non-gating equations
     #Evaluate non gating variables with updated gating values
-    f.f.non_gating_f(u, tmp, p, t)
+    rl_f.non_gating_f(u, tmp, p, t)
 
-    for (i, k) in enumerate(f.f.non_gating_idxs)
+    for (i, k) in enumerate(rl_f.non_gating_idxs)
         u[i] = uprev[i] + dt * u[k]
     end
 
