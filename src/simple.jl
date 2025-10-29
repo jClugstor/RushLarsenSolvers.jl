@@ -89,14 +89,12 @@ end
     # Use Euler for non-gating equations
     #Evaluate non gating variables with updated gating values
     rl_f.non_gating_f(u, tmp, p, t)
-
     for (i, k) in enumerate(rl_f.non_gating_idxs)
-        u[i] = uprev[i] + dt * u[k]
+        u[k] = uprev[k] + dt * u[k]
     end
-
     integ.tprev = t
     integ.t += dt 
-
+    
     return nothing
 end
 
