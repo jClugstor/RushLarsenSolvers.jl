@@ -1,12 +1,9 @@
-module RushLarsenSolversModelingToolkitExt
+module RushLarsenSolversMTKCardiacCellModelsExt
 
 using RushLarsenSolvers
 import RushLarsenSolvers: RushLarsenFunction
-using ModelingToolkit
-
-struct GatingVariable <: ModelingToolkit.Symbolics.AbstractVariableMetadata end
-
-is_gating_variable(var) = ModelingToolkit.Symbolics.hasmetadata(var, GatingVariable) ? ModelingToolkit.Symbolics.getmetadata(var, GatingVariable) : false
+using MTKCardiacCellModels: is_gating_variable
+import MTKCardiacCellModels.ModelingToolkit as MTK
 
 # ============================================================================
 # RushLarsenFunction Constructor from MTK System
@@ -29,15 +26,15 @@ This constructor automatically:
 # Returns
 - `RushLarsenFunction`: A function object suitable for use with RushLarsen algorithm
 """
-function RushLarsenSolvers.RushLarsenFunction(sys::ModelingToolkit.System)
+function RushLarsenSolvers.RushLarsenFunction(sys::MTK.System)
     # Get system information
-    eqs = ModelingToolkit.equations(sys)
-    states = ModelingToolkit.unknowns(sys)
-    params = ModelingToolkit.parameters(sys)
-    iv = ModelingToolkit.get_iv(sys)
+    eqs = MTK.equations(sys)
+    states = MTK.unknowns(sys)
+    params = MTK.parameters(sys)
+    iv = MTK.get_iv(sys)
 
     # Get observed equations and create substitution dictionary
-    observed_eqs = ModelingToolkit.observed(sys)
+    observed_eqs = MTK.observed(sys)
     obs_subs = Dict(eq.lhs => eq.rhs for eq in observed_eqs)
 
     # Helper function to recursively substitute observed variables
@@ -49,7 +46,7 @@ function RushLarsenSolvers.RushLarsenFunction(sys::ModelingToolkit.System)
         prev_expr = expr
         max_iterations = 100  # Prevent infinite loops
         for _ in 1:max_iterations
-            new_expr = ModelingToolkit.substitute(prev_expr, obs_subs)
+            new_expr = MTK.substitute(prev_expr, obs_subs)
             if isequal(new_expr, prev_expr)
                 break
             end
@@ -102,7 +99,7 @@ function RushLarsenSolvers.RushLarsenFunction(sys::ModelingToolkit.System)
         β_exprs = [pair[2] for pair in gating_rate_exprs]
         all_rate_exprs = [[exprs[1], exprs[2]] for exprs in zip(α_exprs, β_exprs)]
         # Build the function
-        gating_func = Symbolics.build_function(
+        gating_func = MTK.Symbolics.build_function(
             all_rate_exprs,
             states,
             params,
@@ -135,7 +132,7 @@ function RushLarsenSolvers.RushLarsenFunction(sys::ModelingToolkit.System)
     if isempty(non_gating_eqs)
         non_gating_f = (du, u, p, t) -> nothing
     else
-        non_gating_func = Symbolics.build_function(
+        non_gating_func = MTK.Symbolics.build_function(
             non_gating_eqs,
             states,
             params,
@@ -171,8 +168,8 @@ end
 
 Get all gating variables from a ModelingToolkit system.
 """
-function get_gating_variables(sys::ODESystem)
-    states = ModelingToolkit.unknowns(sys)
+function get_gating_variables(sys::MTK.System)
+    states = MTK.unknowns(sys)
     return filter(is_gating_variable, states)
 end
 
@@ -181,8 +178,8 @@ end
 
 Get all non-gating variables from a ModelingToolkit system.
 """
-function get_nongating_variables(sys::ODESystem)
-    states = ModelingToolkit.unknowns(sys)
+function get_nongating_variables(sys::MTK.System)
+    states = MTK.unknowns(sys)
     return filter(var -> !is_gating_variable(var), states)
 end
 
@@ -211,7 +208,7 @@ This function looks up the α and β expressions from the obs_subs dictionary.
 function extract_alpha_beta_equations(gating_var, obs_subs)
     # Get the parent component name by parsing the gating variable name
     # e.g., for sod_current₊sodium₊m₊y, we want to find sod_current₊sodium₊m₊α and sod_current₊sodium₊m₊β
-    var_name = string(ModelingToolkit.getname(gating_var))
+    var_name = string(MTK.getname(gating_var))
 
     # Remove the trailing 'y' to get the gate base name
     if endswith(var_name, "₊y")
@@ -225,7 +222,7 @@ function extract_alpha_beta_equations(gating_var, obs_subs)
     β_expr = nothing
 
     for (lhs, rhs) in obs_subs
-        lhs_name = string(ModelingToolkit.getname(lhs))
+        lhs_name = string(MTK.getname(lhs))
         if lhs_name == base_name * "α"
             α_expr = rhs
         elseif lhs_name == base_name * "β"
@@ -256,16 +253,16 @@ evaluated to get the rate constants.
 - `var`: The gating variable symbol
 - `voltage`: The voltage variable symbol (unused in current implementation)
 """
-function extract_rate_constants(eq::Equation, var)
+function extract_rate_constants(eq::MTK.Symbolics.Equation, var)
     rhs = eq.rhs
-    expanded = ModelingToolkit.expand_derivatives(rhs)
+    expanded = MTK.expand_derivatives(rhs)
 
     # For equation: α(V)(1-var) - β(V)var = α(V) - (α(V) + β(V))*var
     # Substitute var = 0 to get α(V)
-    α_coeff = ModelingToolkit.substitute(expanded, Dict(var => 0))
+    α_coeff = MTK.substitute(expanded, Dict(var => 0))
 
     # Substitute var = 1 to get -β(V), so β(V) = -result
-    β_coeff = -ModelingToolkit.substitute(expanded, Dict(var => 1))
+    β_coeff = -MTK.substitute(expanded, Dict(var => 1))
 
     return α_coeff, β_coeff
 end
@@ -284,11 +281,11 @@ where each function has the signature `(u, p, t) -> Float64`.
 3. Extract α and β expressions symbolically
 4. Convert to Julia functions that can be evaluated numerically
 """
-function extract_gating_rate_functions(sys::ODESystem)
-    states = ModelingToolkit.unknowns(sys)
+function extract_gating_rate_functions(sys::MTK.System)
+    states = MTK.unknowns(sys)
 
     # Get observed equations and create substitution dictionary
-    observed = ModelingToolkit.observed(sys)
+    observed = MTK.observed(sys)
     obs_subs = Dict(eq.lhs => eq.rhs for eq in observed)
 
     rate_functions = Dict{Int,Tuple{Function,Function}}()
@@ -317,11 +314,11 @@ end
 Find the differential equation corresponding to a specific variable.
 """
 function find_equation_for_variable(eqs, var, sys)
-    iv = ModelingToolkit.get_iv(sys)
-    target_lhs = ModelingToolkit.Differential(iv)(var)
+    iv = MTK.get_iv(sys)
+    target_lhs = MTK.Differential(iv)(var)
 
     for eq in eqs
-        if ModelingToolkit.isequal(eq.lhs, target_lhs)
+        if MTK.isequal(eq.lhs, target_lhs)
             return eq
         end
     end
@@ -339,7 +336,7 @@ function create_rate_function(expr, states, sys)
         subs = Dict(st => u[j] for (j, st) in enumerate(states))
 
         # Handle parameters if present
-        params = ModelingToolkit.parameters(sys)
+        params = MTK.parameters(sys)
         if !isempty(params) && p !== nothing && length(p) >= length(params)
             for (j, par) in enumerate(params)
                 subs[par] = p[j]
@@ -347,7 +344,7 @@ function create_rate_function(expr, states, sys)
         end
 
         # Evaluate and return as float
-        result = ModelingToolkit.substitute(expr, subs)
+        result = MTK.substitute(expr, subs)
         return float(result)
     end
 end
