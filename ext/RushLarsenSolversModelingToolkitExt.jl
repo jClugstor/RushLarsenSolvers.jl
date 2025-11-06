@@ -1,9 +1,12 @@
 module RushLarsenSolversModelingToolkitExt
 
 using RushLarsenSolvers
+import RushLarsenSolvers: RushLarsenFunction
 using ModelingToolkit
-using ModelingToolkit: System
 
+struct GatingVariable <: ModelingToolkit.Symbolics.AbstractVariableMetadata end
+
+is_gating_variable(var) = ModelingToolkit.Symbolics.hasmetadata(var, GatingVariable) ? ModelingToolkit.Symbolics.getmetadata(var, GatingVariable) : false
 
 # ============================================================================
 # RushLarsenFunction Constructor from MTK System
@@ -26,7 +29,7 @@ This constructor automatically:
 # Returns
 - `RushLarsenFunction`: A function object suitable for use with RushLarsen algorithm
 """
-function RushLarsenSolvers.RushLarsenFunction(sys::System)
+function RushLarsenSolvers.RushLarsenFunction(sys::ModelingToolkit.System)
     # Get system information
     eqs = ModelingToolkit.equations(sys)
     states = ModelingToolkit.unknowns(sys)
