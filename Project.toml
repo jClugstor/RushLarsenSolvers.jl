@@ -1,6 +1,6 @@
 name = "RushLarsenSolvers"
 uuid = "b6f3d1c9-8097-4b1b-8f54-e3bff95fe181"
-version = "1.0.0-DEV"
+version = "0.1.0"
 authors = ["jClugstor <jadonclugston@gmail.com> and contributors"]
 
 [deps]
@@ -27,3 +27,9 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
 test = ["Test"]
+
+[weakdeps]
+ModelingToolkit = "961ee093-0014-501f-94e3-6117800e7a78"
+
+[extensions]
+RushLarsenSolversModelingToolkitExt = "ModelingToolkit"
