@@ -11,7 +11,6 @@ module RushLarsenSolvers
 
     include("simple.jl")
 
-    struct GatingVariable <: ModelingToolkit.Symbolics.AbstractVariableMetadata end
     is_gating_variable(var) = false
 
     export RushLarsen, RushLarsenFunction
