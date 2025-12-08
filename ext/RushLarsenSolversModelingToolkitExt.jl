@@ -6,8 +6,15 @@ using RushLarsenSolvers: is_gating_variable
 using ModelingToolkit
 
 struct GatingVariable <: ModelingToolkit.Symbolics.AbstractVariableMetadata end
-ModelingToolkit.Symbolics.option_to_metadata_type(::Val{:gating}) = GatingVariable
-RushLarsenSolvers.is_gating_variable(var::ModelingToolkit.Symbolics.Num) = ModelingToolkit.Symbolics.hasmetadata(var, GatingVariable) ? ModelingToolkit.Symbolics.getmetadata(var, GatingVariable) : false
+struct AlphaBetaGate <: ModelingToolkit.Symbolics.AbstractVariableMetadata end 
+struct TauGate <: ModelingToolkit.Symbolics.AbstractVariableMetadata end 
+
+ModelingToolkit.Symbolics.option_to_metadata_type(::Val{:tau_gate}) = TauGate
+ModelingToolkit.Symbolics.option_to_metadata_type(::Val{:alpha_beta_gate}) = AlphaBetaGate
+
+RushLarsenSolvers.is_tau_variable(var::ModelingToolkit.Symbolics.Num) = ModelingToolkit.Symbolics.hasmetadata(var, GatingVariable) ? ModelingToolkit.Symbolics.getmetadata(var, GatingVariable) : false
+RushLarsenSolvers.is_alphabeta_variable(var::ModelingToolkit.Symbolics.Num) = ModelingToolkit.Symbolics.hasmetadata(var, GatingVariable) ? ModelingToolkit.Symbolics.getmetadata(var, GatingVariable) : false
+
 # ============================================================================
 # RushLarsenFunction Constructor from ModelingToolkit System
 # ============================================================================
