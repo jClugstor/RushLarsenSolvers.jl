@@ -66,21 +66,37 @@ end
     else
         rl_f = f.f
     end
-
     rl_f.gating_f(gating_vars, u, p, t)
 
     for (i, k) in enumerate(rl_f.gating_idxs)
-        alpha_i = gating_vars[i][1]
-        beta_i = gating_vars[i][2]
-        # Rush-Larsen formula: u_new = u_inf + (u_old - u_inf) * exp(-dt/tau)
-        # where u_inf = alpha/(alpha+beta) and tau = 1/(alpha+beta)
-        if alpha_i + beta_i < 1e-14
-            # Handle special case to avoid division by zero
-            u[k] = uprev[k]
+        val1 = gating_vars[i][1]
+        val2 = gating_vars[i][2]
+
+        # Check gate type if available
+        if rl_f.gate_types !== nothing && i <= length(rl_f.gate_types) && rl_f.gate_types[i] == :tau
+            # Tau-type gate: val1 = tau, val2 = g_inf
+            tau = val1
+            u_inf = val2
+            if tau < 1e-14
+                # Handle special case to avoid division by zero
+                u[k] = u_inf  # Instantaneous jump to steady state
+            else
+                u[k] = u_inf + (uprev[k] - u_inf) * exp(-dt / tau)
+            end
         else
-            u_inf = alpha_i / (alpha_i + beta_i)
-            tau = 1 / (alpha_i + beta_i)
-            u[k] = u_inf + (uprev[k] - u_inf) * exp(-dt / tau)
+            # Alpha-beta gate: val1 = alpha, val2 = beta
+            alpha_i = val1
+            beta_i = val2
+            # Rush-Larsen formula: u_new = u_inf + (u_old - u_inf) * exp(-dt/tau)
+            # where u_inf = alpha/(alpha+beta) and tau = 1/(alpha+beta)
+            if alpha_i + beta_i < 1e-14
+                # Handle special case to avoid division by zero
+                u[k] = uprev[k]
+            else
+                u_inf = alpha_i / (alpha_i + beta_i)
+                tau = 1 / (alpha_i + beta_i)
+                u[k] = u_inf + (uprev[k] - u_inf) * exp(-dt / tau)
+            end
         end
     end
 
@@ -169,10 +185,11 @@ end
 
     gating_idxs
     non_gating_idxs
+    gate_types  # Vector of :tau or :alpha_beta symbols
 end
 
-function RushLarsenFunction(gating_f, non_gating_f; gating_idxs = nothing, non_gating_idxs = nothing)
-    RushLarsenFunction(gating_f, non_gating_f, gating_idxs, non_gating_idxs)
+function RushLarsenFunction(gating_f, non_gating_f; gating_idxs = nothing, non_gating_idxs = nothing, gate_types = nothing)
+    RushLarsenFunction(gating_f, non_gating_f, gating_idxs, non_gating_idxs, gate_types)
 end
 
 # For compatibility with other ODE solvers
@@ -183,14 +200,22 @@ function (f::RushLarsenFunction)(u,p,t)
     gating_vars = f.gating_f(u,p,t)
     for (i,k) in enumerate(f.gating_idxs)
         # alpha, beta = gating_vars[i]
-        du[k] = gating_var[i][1]*(1 - u[k]) - gating_vars[i][2]*u[k]
+        du[k] = gating_vars[i][1]*(1 - u[k]) - gating_vars[i][2]*u[k]
     end
-    
+
     du[f.non_gating_idxs] .= f.non_gating_f(u,p,t)
-    
+
     du
 end
 
 function (f::RushLarsenFunction)(du,u,p,t)
+    gating_vars = f.gating_f(u,p,t)
+    for (i,k) in enumerate(f.gating_idxs)
+        # alpha, beta = gating_vars[i]
+        du[k] = gating_vars[i][1]*(1 - u[k]) - gating_vars[i][2]*u[k]
+    end
 
+    du[f.non_gating_idxs] .= f.non_gating_f(u,p,t)
+
+    return nothing
 end
