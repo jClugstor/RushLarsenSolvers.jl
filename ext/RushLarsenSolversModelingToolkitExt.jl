@@ -617,7 +617,22 @@ u0_numeric = process_u0(sys, u0_symbolic)
 ```
 """
 function process_u0(sys::RushLarsenSystem, u0)
-    if u0 isa AbstractVector{<:Pair}
+    # Handle empty array - use all defaults
+    if isempty(u0)
+        states = ModelingToolkit.unknowns(sys.sys)
+        defaults = SymbolicIndexingInterface.default_values(sys)
+        u0_numeric = zeros(length(states))
+
+        for (i, state) in enumerate(states)
+            if haskey(defaults, state)
+                u0_numeric[i] = defaults[state]
+            else
+                error("No default value available for state $state")
+            end
+        end
+
+        return u0_numeric
+    elseif u0 isa AbstractVector{<:Pair}
         # Get the state order from the system
         states = ModelingToolkit.unknowns(sys.sys)
         u0_numeric = zeros(length(states))
@@ -660,7 +675,22 @@ p_numeric = process_p(sys, p_symbolic)
 ```
 """
 function process_p(sys::RushLarsenSystem, p)
-    if p isa AbstractVector{<:Pair}
+    # Handle empty array - use all defaults
+    if isempty(p)
+        params = ModelingToolkit.parameters(sys.sys)
+        defaults = SymbolicIndexingInterface.default_values(sys)
+        p_numeric = zeros(length(params))
+
+        for (i, param) in enumerate(params)
+            if haskey(defaults, param)
+                p_numeric[i] = defaults[param]
+            else
+                error("No default value available for parameter $param")
+            end
+        end
+
+        return p_numeric
+    elseif p isa AbstractVector{<:Pair}
         # Get the parameter order from the system
         params = ModelingToolkit.parameters(sys.sys)
         p_numeric = zeros(length(params))
