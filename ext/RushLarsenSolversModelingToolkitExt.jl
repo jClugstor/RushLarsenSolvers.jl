@@ -4,16 +4,17 @@ using RushLarsenSolvers
 import RushLarsenSolvers: RushLarsenFunction
 using RushLarsenSolvers: is_gating_variable
 using ModelingToolkit
+import ModelingToolkit.SymbolicIndexingInterface as SymbolicIndexingInterface
 
-struct GatingVariable <: ModelingToolkit.Symbolics.AbstractVariableMetadata end
-struct AlphaBetaGate <: ModelingToolkit.Symbolics.AbstractVariableMetadata end 
+struct AlphaBetaGate <: ModelingToolkit.Symbolics.AbstractVariableMetadata end
 struct TauGate <: ModelingToolkit.Symbolics.AbstractVariableMetadata end 
 
 ModelingToolkit.Symbolics.option_to_metadata_type(::Val{:tau_gate}) = TauGate
 ModelingToolkit.Symbolics.option_to_metadata_type(::Val{:alpha_beta_gate}) = AlphaBetaGate
 
-RushLarsenSolvers.is_tau_variable(var::ModelingToolkit.Symbolics.Num) = ModelingToolkit.Symbolics.hasmetadata(var, GatingVariable) ? ModelingToolkit.Symbolics.getmetadata(var, GatingVariable) : false
-RushLarsenSolvers.is_alphabeta_variable(var::ModelingToolkit.Symbolics.Num) = ModelingToolkit.Symbolics.hasmetadata(var, GatingVariable) ? ModelingToolkit.Symbolics.getmetadata(var, GatingVariable) : false
+RushLarsenSolvers.is_tau_variable(var::ModelingToolkit.Symbolics.BasicSymbolic) = ModelingToolkit.Symbolics.hasmetadata(var, TauGate)
+RushLarsenSolvers.is_alphabeta_variable(var::ModelingToolkit.Symbolics.BasicSymbolic) = ModelingToolkit.Symbolics.hasmetadata(var, AlphaBetaGate)
+RushLarsenSolvers.is_gating_variable(var::ModelingToolkit.Symbolics.BasicSymbolic) = RushLarsenSolvers.is_tau_variable(var) || RushLarsenSolvers.is_alphabeta_variable(var)
 
 # ============================================================================
 # RushLarsenFunction Constructor from ModelingToolkit System
@@ -91,51 +92,68 @@ function RushLarsenSolvers.RushLarsenFunction(sys::ModelingToolkit.System)
         end
     end
 
-    # Build gating function that returns vector of (α, β) tuples
+    # Build gating function that returns vector of (τ, g_inf) tuples
+    # For compatibility, we still call them (α, β) in the tuple but they represent (tau, inf)
     gating_rate_exprs = []
+    gate_types = []  # Track whether each gate is tau or alpha-beta
     for (state, eq) in gating_eqs
-        α_expr, β_expr = extract_alpha_beta_equations(state, obs_subs)
-        # Substitute observed variables in α and β expressions
-        α_expr = substitute_observed(α_expr)
-        β_expr = substitute_observed(β_expr)
-        push!(gating_rate_exprs, (α_expr, β_expr))
+        # Check if this is a tau-type gate or alpha-beta gate
+        if RushLarsenSolvers.is_tau_variable(state)
+            # Extract tau and inf from equation structure
+            tau_expr, inf_expr = extract_tau_inf_from_equation(eq, state, obs_subs)
+            push!(gating_rate_exprs, (tau_expr, inf_expr))
+            push!(gate_types, :tau)
+        else
+            # Extract alpha and beta (default behavior)
+            α_expr, β_expr = extract_alpha_beta_equations(state, obs_subs)
+            α_expr = substitute_observed(α_expr)
+            β_expr = substitute_observed(β_expr)
+            push!(gating_rate_exprs, (α_expr, β_expr))
+            push!(gate_types, :alpha_beta)
+        end
     end
     # Create gating function using Symbolics.build_function
     if isempty(gating_rate_exprs)
         gating_f = (gating_vars, u, p, t) -> nothing
     else
-        # Flatten the (α, β) pairs into a single vector for build_function
+        # Build separate functions for tau/alpha and inf/beta, then combine
         α_exprs = [pair[1] for pair in gating_rate_exprs]
         β_exprs = [pair[2] for pair in gating_rate_exprs]
-        all_rate_exprs = [[exprs[1], exprs[2]] for exprs in zip(α_exprs, β_exprs)]
-        # Build the function
-        gating_func = ModelingToolkit.Symbolics.build_function(
-            all_rate_exprs,
+
+        # Build functions for the first and second components separately
+        α_func_tuple = ModelingToolkit.Symbolics.build_function(
+            α_exprs,
             states,
             params,
             iv,
             expression=Val{false}
         )
 
+        β_func_tuple = ModelingToolkit.Symbolics.build_function(
+            β_exprs,
+            states,
+            params,
+            iv,
+            expression=Val{false}
+        )
+
+        # Extract out-of-place versions
+        α_func = α_func_tuple[1]
+        β_func = β_func_tuple[1]
+
         # Wrap to produce vector of (α, β) tuples
         n_gating = length(gating_rate_exprs)
-        if gating_func isa Tuple
-            # Use out-of-place version
-            #base_func = gating_func[1]
-            gating_f = (gating_vars, u, p, t) -> begin
-                result = gating_func[1](u, p, t)
-                for i in 1:n_gating
-                    gating_vars[i] = (result[i][1], result[i][2])
-                end
-            end
-        else
-            gating_f = (gating_vars, u, p, t) -> begin
-                result = gating_func[1](u, p, t)
-                for i in 1:n_gating
-                    gating_vars[i] = (result[i][1], result[i][2])
-                end
+
+        # Create a proper function instead of a closure
+        function gating_wrapper(gating_vars, u, p, t)
+            α_result = α_func(u, p, t)
+            β_result = β_func(u, p, t)
+            for i in 1:n_gating
+                gating_vars[i] = (α_result[i], β_result[i])
             end
         end
+
+        gating_f = gating_wrapper
     end
 
     # Build non-gating function using Symbolics.build_function
@@ -152,17 +170,19 @@ function RushLarsenSolvers.RushLarsenFunction(sys::ModelingToolkit.System)
 
         # Wrap to write results to the correct indices in du
         if non_gating_func isa Tuple
-            # Use out-of-place version and map to indices
+            # Use out-of-place version and map to indices - extract function from tuple
+            base_func = non_gating_func[1]
             non_gating_f = (du, u, p, t) -> begin
-                result = non_gating_func[1](u, p, t)
+                result = base_func(u, p, t)
                 for (i, idx) in enumerate(non_gating_idxs)
                     du[idx] = result[i]
                 end
             end
         else
-            # Out-of-place only version
+            # Out-of-place only version - capture in local variable
+            base_func = non_gating_func
             non_gating_f = (du, u, p, t) -> begin
-                result = non_gating_func(u, p, t)
+                result = base_func(u, p, t)
                 for (i, idx) in enumerate(non_gating_idxs)
                     du[idx] = result[i]
                 end
@@ -170,7 +190,7 @@ function RushLarsenSolvers.RushLarsenFunction(sys::ModelingToolkit.System)
         end
     end
 
-    return RushLarsenSolvers.RushLarsenFunction(gating_f, non_gating_f, gating_idxs, non_gating_idxs)
+    return RushLarsenSolvers.RushLarsenFunction(gating_f, non_gating_f, gating_idxs, non_gating_idxs, gate_types)
 end
 
 """
@@ -245,6 +265,132 @@ function extract_alpha_beta_equations(gating_var, obs_subs)
     end
 
     return α_expr, β_expr
+end
+
+"""
+    extract_tau_inf_from_equation(eq, gating_var, obs_subs)
+
+Extract τ and g_inf directly from the structure of a tau-type gate equation.
+
+For a tau-type gate, the equation has the form:
+    dg/dt = (g_inf - g) / tau_g
+
+This function parses this structure to extract tau_g and g_inf expressions.
+
+# Arguments
+- `eq`: The differential equation for the gating variable
+- `gating_var`: The gating variable (e.g., m, h, n)
+- `obs_subs`: Dictionary mapping observed variables to their expressions
+
+# Returns
+- `(tau_expr, inf_expr)`: The expressions for τ and steady-state
+"""
+function extract_tau_inf_from_equation(eq, gating_var, obs_subs)
+    rhs = eq.rhs
+
+    # The equation should be of the form: (g_inf - g) / tau
+    # or equivalently: g_inf/tau - g/tau
+    # Try to match the pattern (A - var) / B where A is g_inf and B is tau
+    # Using Symbolics pattern matching
+    if ModelingToolkit.Symbolics.istree(rhs)
+        op = ModelingToolkit.Symbolics.operation(rhs)
+        args = ModelingToolkit.Symbolics.arguments(rhs)
+
+        # Check if it's a division: (numerator) / (denominator)
+        if op == (/)
+            numerator = args[1]
+            denominator = args[2]
+            # The numerator should be (g_inf - g) which can be represented as:
+            # 1. Subtraction: (g_inf - g)
+            # 2. Addition with negative: (g_inf + (-g))
+            if ModelingToolkit.Symbolics.istree(numerator)
+                num_op = ModelingToolkit.Symbolics.operation(numerator)
+                num_args = ModelingToolkit.Symbolics.arguments(numerator)
+
+                # Check if numerator is a subtraction: (g_inf - g)
+                if num_op == (-) && length(num_args) == 2
+                    # First term should be g_inf, second should be the gating variable
+                    if ModelingToolkit.isequal(num_args[2], gating_var)
+                        g_inf_expr = num_args[1]
+                        tau_expr = denominator
+
+                        # Substitute observed variables
+                        g_inf_expr = substitute_observed_recursive(g_inf_expr, obs_subs)
+                        tau_expr = substitute_observed_recursive(tau_expr, obs_subs)
+
+                        return tau_expr, g_inf_expr
+                    end
+                # Check if numerator is an addition: could be (g_inf + (-g)) or ((-g) + g_inf)
+                elseif num_op == (+) && length(num_args) == 2
+                    first_arg = num_args[1]
+                    second_arg = num_args[2]
+
+                    # Helper function to check if an expression is negative of the gating variable
+                    is_neg_gate = (expr) -> begin
+                        if ModelingToolkit.Symbolics.istree(expr)
+                            op = ModelingToolkit.Symbolics.operation(expr)
+                            args = ModelingToolkit.Symbolics.arguments(expr)
+
+                            # Check for multiplication with -1: (-1 * g) or (g * -1)
+                            if op == (*) && length(args) == 2
+                                return (args[1] == -1 && ModelingToolkit.isequal(args[2], gating_var)) ||
+                                       (args[2] == -1 && ModelingToolkit.isequal(args[1], gating_var))
+                            # Check for unary negation: -(g)
+                            elseif op == (-) && length(args) == 1
+                                return ModelingToolkit.isequal(args[1], gating_var)
+                            end
+                        end
+                        return false
+                    end
+
+                    # Check if second argument is negative of gating variable: (g_inf + (-g))
+                    if is_neg_gate(second_arg)
+                        g_inf_expr = first_arg
+                        tau_expr = denominator
+
+                        # Substitute observed variables
+                        g_inf_expr = substitute_observed_recursive(g_inf_expr, obs_subs)
+                        tau_expr = substitute_observed_recursive(tau_expr, obs_subs)
+
+                        return tau_expr, g_inf_expr
+                    # Check if first argument is negative of gating variable: ((-g) + g_inf)
+                    elseif is_neg_gate(first_arg)
+                        g_inf_expr = second_arg
+                        tau_expr = denominator
+
+                        # Substitute observed variables
+                        g_inf_expr = substitute_observed_recursive(g_inf_expr, obs_subs)
+                        tau_expr = substitute_observed_recursive(tau_expr, obs_subs)
+
+                        return tau_expr, g_inf_expr
+                    end
+                end
+            end
+        end
+    end
+
+    error("Could not extract tau and inf from equation structure for variable $(gating_var). Expected form: (g_inf - g) / tau")
+end
+
+"""
+    substitute_observed_recursive(expr, obs_subs)
+
+Recursively substitute observed variables until no more substitutions are possible.
+"""
+function substitute_observed_recursive(expr, obs_subs)
+    if isempty(obs_subs)
+        return expr
+    end
+    prev_expr = expr
+    max_iterations = 100
+    for _ in 1:max_iterations
+        new_expr = ModelingToolkit.substitute(prev_expr, obs_subs)
+        if isequal(new_expr, prev_expr)
+            break
+        end
+        prev_expr = new_expr
+    end
+    return prev_expr
 end
 
 """
@@ -357,6 +503,225 @@ function create_rate_function(expr, states, sys)
         result = ModelingToolkit.substitute(expr, subs)
         return float(result)
     end
+end
+
+"""
+    RushLarsenSystem
+
+Wrapper that combines a ModelingToolkit ODESystem with a RushLarsenFunction
+to enable symbolic indexing for parameters and initial conditions.
+
+# Fields
+- `sys::System`: The original ModelingToolkit system
+- `rlf::RushLarsenFunction`: The compiled Rush-Larsen function
+"""
+struct RushLarsenSystem
+    sys::ModelingToolkit.System
+    rlf::RushLarsenFunction
+end
+
+"""
+    RushLarsenSystem(sys::System)
+
+Create a RushLarsenSystem from a ModelingToolkit ODESystem.
+Automatically constructs the RushLarsenFunction internally.
+"""
+function RushLarsenSolvers.RushLarsenSystem(sys::ModelingToolkit.System)
+    rlf = RushLarsenFunction(sys)
+    return RushLarsenSystem(sys, rlf)
+end
+
+# ============================================================================
+# SymbolicIndexingInterface Implementation
+# ============================================================================
+
+# Symbol Classification - Variables (States)
+function SymbolicIndexingInterface.is_variable(sys::RushLarsenSystem, sym)
+    return SymbolicIndexingInterface.is_variable(sys.sys, sym)
+end
+
+function SymbolicIndexingInterface.variable_index(sys::RushLarsenSystem, sym)
+    return SymbolicIndexingInterface.variable_index(sys.sys, sym)
+end
+
+function SymbolicIndexingInterface.variable_symbols(sys::RushLarsenSystem)
+    return SymbolicIndexingInterface.variable_symbols(sys.sys)
+end
+
+# Symbol Classification - Parameters
+function SymbolicIndexingInterface.is_parameter(sys::RushLarsenSystem, sym)
+    return SymbolicIndexingInterface.is_parameter(sys.sys, sym)
+end
+
+function SymbolicIndexingInterface.parameter_index(sys::RushLarsenSystem, sym)
+    return SymbolicIndexingInterface.parameter_index(sys.sys, sym)
+end
+
+function SymbolicIndexingInterface.parameter_symbols(sys::RushLarsenSystem)
+    return SymbolicIndexingInterface.parameter_symbols(sys.sys)
+end
+
+# Symbol Classification - Independent Variables
+function SymbolicIndexingInterface.is_independent_variable(sys::RushLarsenSystem, sym)
+    return SymbolicIndexingInterface.is_independent_variable(sys.sys, sym)
+end
+
+function SymbolicIndexingInterface.independent_variable_symbols(sys::RushLarsenSystem)
+    return SymbolicIndexingInterface.independent_variable_symbols(sys.sys)
+end
+
+function SymbolicIndexingInterface.is_time_dependent(sys::RushLarsenSystem)
+    return SymbolicIndexingInterface.is_time_dependent(sys.sys)
+end
+
+# System Metadata
+function SymbolicIndexingInterface.constant_structure(sys::RushLarsenSystem)
+    return true  # RushLarsen systems have constant structure
+end
+
+function SymbolicIndexingInterface.all_variable_symbols(sys::RushLarsenSystem)
+    return SymbolicIndexingInterface.all_variable_symbols(sys.sys)
+end
+
+function SymbolicIndexingInterface.all_symbols(sys::RushLarsenSystem)
+    return SymbolicIndexingInterface.all_symbols(sys.sys)
+end
+
+function SymbolicIndexingInterface.default_values(sys::RushLarsenSystem)
+    return SymbolicIndexingInterface.default_values(sys.sys)
+end
+
+# Observed Equations
+function SymbolicIndexingInterface.is_observed(sys::RushLarsenSystem, sym)
+    return SymbolicIndexingInterface.is_observed(sys.sys, sym)
+end
+
+function SymbolicIndexingInterface.observed(sys::RushLarsenSystem, sym)
+    return SymbolicIndexingInterface.observed(sys.sys, sym)
+end
+
+# ============================================================================
+# Helper Functions for Creating Problems
+# ============================================================================
+
+"""
+    process_u0(sys::RushLarsenSystem, u0)
+
+Convert symbolic u0 (Vector of Pairs) to numeric vector in correct order.
+
+# Examples
+```julia
+sys = RushLarsenSystem(hh_model)
+u0_symbolic = [hh_model.V => -65.0, hh_model.m => 0.05, hh_model.h => 0.6, hh_model.n => 0.318]
+u0_numeric = process_u0(sys, u0_symbolic)
+```
+"""
+function process_u0(sys::RushLarsenSystem, u0)
+    if u0 isa AbstractVector{<:Pair}
+        # Get the state order from the system
+        states = ModelingToolkit.unknowns(sys.sys)
+        u0_numeric = zeros(length(states))
+
+        # Create a dictionary from the pairs
+        u0_dict = Dict(u0)
+
+        # Fill in values in the correct order
+        for (i, state) in enumerate(states)
+            if haskey(u0_dict, state)
+                u0_numeric[i] = u0_dict[state]
+            else
+                # Try to get default value
+                defaults = SymbolicIndexingInterface.default_values(sys)
+                if haskey(defaults, state)
+                    u0_numeric[i] = defaults[state]
+                else
+                    error("No initial condition provided for state $state and no default value available")
+                end
+            end
+        end
+
+        return u0_numeric
+    else
+        # Already numeric
+        return u0
+    end
+end
+
+"""
+    process_p(sys::RushLarsenSystem, p)
+
+Convert symbolic parameters (Vector of Pairs) to numeric vector in correct order.
+
+# Examples
+```julia
+sys = RushLarsenSystem(hh_model)
+p_symbolic = [hh_model.C_m => 1.0, hh_model.g_Na => 120.0, ...]
+p_numeric = process_p(sys, p_symbolic)
+```
+"""
+function process_p(sys::RushLarsenSystem, p)
+    if p isa AbstractVector{<:Pair}
+        # Get the parameter order from the system
+        params = ModelingToolkit.parameters(sys.sys)
+        p_numeric = zeros(length(params))
+
+        # Create a dictionary from the pairs
+        p_dict = Dict(p)
+
+        # Fill in values in the correct order
+        for (i, param) in enumerate(params)
+            if haskey(p_dict, param)
+                p_numeric[i] = p_dict[param]
+            else
+                # Try to get default value
+                defaults = SymbolicIndexingInterface.default_values(sys)
+                if haskey(defaults, param)
+                    p_numeric[i] = defaults[param]
+                else
+                    error("No value provided for parameter $param and no default value available")
+                end
+            end
+        end
+
+        return p_numeric
+    else
+        # Already numeric
+        return p
+    end
+end
+
+"""
+    RushLarsenProblem(sys::RushLarsenSystem, u0, tspan, p=nothing)
+
+Create an ODEProblem with the RushLarsenFunction, from a RushLarsenSystem. Supports symbolic u0 and p.
+
+# Examples
+```julia
+sys = RushLarsenSystem(hh_model)
+
+# Symbolic specification
+u0 = [hh_model.V => -65.0, hh_model.m => 0.05, hh_model.h => 0.6, hh_model.n => 0.318]
+p = [hh_model.C_m => 1.0, hh_model.g_Na => 120.0, ...]
+prob = RushLarsenProblem(sys, u0, (0.0, 100.0), p)
+
+# Or use defaults for missing values
+u0 = [hh_model.V => -65.0]  # Other states use defaults
+prob = RushLarsenProblem(sys, u0, (0.0, 100.0))
+```
+"""
+function RushLarsenSolvers.RushLarsenProblem(sys::RushLarsenSystem, u0, tspan, p=nothing)
+    u0_numeric = process_u0(sys, u0)
+
+    if p === nothing
+        # Use all default values
+        defaults = SymbolicIndexingInterface.default_values(sys)
+        params = ModelingToolkit.parameters(sys.sys)
+        p_numeric = [defaults[param] for param in params]
+    else
+        p_numeric = process_p(sys, p)
+    end
+
+    return ODEProblem(sys.rlf, u0_numeric, tspan, p_numeric)
 end
 
 end # module
