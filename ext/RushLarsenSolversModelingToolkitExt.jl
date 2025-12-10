@@ -7,21 +7,49 @@ using ModelingToolkit
 import ModelingToolkit.SymbolicIndexingInterface as SymbolicIndexingInterface
 
 struct AlphaBetaGate <: ModelingToolkit.Symbolics.AbstractVariableMetadata end
-struct TauGate <: ModelingToolkit.Symbolics.AbstractVariableMetadata end 
+struct TauGate <: ModelingToolkit.Symbolics.AbstractVariableMetadata end
 
 ModelingToolkit.Symbolics.option_to_metadata_type(::Val{:tau_gate}) = TauGate
 ModelingToolkit.Symbolics.option_to_metadata_type(::Val{:alpha_beta_gate}) = AlphaBetaGate
 
+# Callable struct to avoid type instability in closures
+struct NonGatingWrapper{F,B<:AbstractVector,I<:AbstractVector{Int}}
+    base_func::F
+    buffer::B
+    non_gating_idxs::I
+end
+
+@inline function (wrapper::NonGatingWrapper)(du, u, p, t)
+    wrapper.base_func(wrapper.buffer, u, p, t)
+    @inbounds for (i, idx) in enumerate(wrapper.non_gating_idxs)
+        du[idx] = wrapper.buffer[i]
+    end
+    return nothing
+end
+
+# Callable struct for gating functions to avoid type instability
+struct GatingWrapper{FA,FB}
+    α_func::FA
+    β_func::FB
+end
+
+@inline function (wrapper::GatingWrapper)(gating_vars, u, p, t)
+    wrapper.α_func(gating_vars[1], u, p, t)
+    wrapper.β_func(gating_vars[2], u, p, t)
+    return nothing
+end
+
 RushLarsenSolvers.is_tau_variable(var::ModelingToolkit.Symbolics.BasicSymbolic) = ModelingToolkit.Symbolics.hasmetadata(var, TauGate)
 RushLarsenSolvers.is_alphabeta_variable(var::ModelingToolkit.Symbolics.BasicSymbolic) = ModelingToolkit.Symbolics.hasmetadata(var, AlphaBetaGate)
 RushLarsenSolvers.is_gating_variable(var::ModelingToolkit.Symbolics.BasicSymbolic) = RushLarsenSolvers.is_tau_variable(var) || RushLarsenSolvers.is_alphabeta_variable(var)
+
 
 # ============================================================================
 # RushLarsenFunction Constructor from ModelingToolkit System
 # ============================================================================
 
 """
-    RushLarsenFunction(sys::ODESystem)
+    RushLarsenFunction(sys::ODESystem; simplify=true, cse=true)
 
 Construct a RushLarsenFunction from a ModelingToolkit ODESystem.
 
@@ -34,10 +62,14 @@ This constructor automatically:
 # Arguments
 - `sys::ODESystem`: A ModelingToolkit ODESystem with gating variables marked
 
+# Keyword Arguments
+- `simplify::Bool=true`: Whether to simplify symbolic expressions before code generation
+- `cse::Bool=true`: Whether to use common subexpression elimination in code generation
+
 # Returns
 - `RushLarsenFunction`: A function object suitable for use with RushLarsen algorithm
 """
-function RushLarsenSolvers.RushLarsenFunction(sys::ModelingToolkit.System)
+function RushLarsenSolvers.RushLarsenFunction(sys::ModelingToolkit.System; simplify::Bool=true, cse::Bool=true)
     # Get system information
     eqs = ModelingToolkit.equations(sys)
     states = ModelingToolkit.unknowns(sys)
@@ -69,8 +101,8 @@ function RushLarsenSolvers.RushLarsenFunction(sys::ModelingToolkit.System)
     # Separate gating and non-gating variables
     gating_idxs = Int[]
     non_gating_idxs = Int[]
-    gating_eqs = []
-    non_gating_eqs = []
+    gating_eqs = Tuple{Any,Any}[]  # Type-annotate to avoid Vector{Any}
+    non_gating_eqs = Any[]  # Will be homogeneous symbolic expressions
 
     for (i, state) in enumerate(states)
         if is_gating_variable(state)
@@ -87,15 +119,17 @@ function RushLarsenSolvers.RushLarsenFunction(sys::ModelingToolkit.System)
             if eq !== nothing
                 # Substitute observed variables in the RHS
                 rhs_substituted = substitute_observed(eq.rhs)
-                push!(non_gating_eqs, rhs_substituted)
+                # Optionally simplify the expression to reduce complexity
+                rhs_final = simplify ? ModelingToolkit.Symbolics.simplify(rhs_substituted) : rhs_substituted
+                push!(non_gating_eqs, rhs_final)
             end
         end
     end
 
     # Build gating function that returns vector of (τ, g_inf) tuples
     # For compatibility, we still call them (α, β) in the tuple but they represent (tau, inf)
-    gating_rate_exprs = []
-    gate_types = []  # Track whether each gate is tau or alpha-beta
+    gating_rate_exprs = Tuple{Any,Any}[]  # Type-annotate to avoid Vector{Any}
+    gate_types = Symbol[]  # Track whether each gate is tau or alpha-beta
     for (state, eq) in gating_eqs
         # Check if this is a tau-type gate or alpha-beta gate
         if RushLarsenSolvers.is_tau_variable(state)
@@ -117,69 +151,58 @@ function RushLarsenSolvers.RushLarsenFunction(sys::ModelingToolkit.System)
         gating_f = (gating_vars, u, p, t) -> nothing
     else
         # Build separate functions for tau/alpha and inf/beta, then combine
+        # Extract first and second elements of tuples
         α_exprs = [pair[1] for pair in gating_rate_exprs]
         β_exprs = [pair[2] for pair in gating_rate_exprs]
 
-        # Build functions for the first and second components separately
-        α_func_tuple = ModelingToolkit.Symbolics.build_function(
-            α_exprs,
-            states,
-            params,
-            iv,
-            expression=Val{false}
+        # Build IN-PLACE functions to avoid allocations
+        # Use ModelingToolkit's build_function_wrapper for better code generation
+        α_func_tuple = ModelingToolkit.build_function_wrapper(
+            sys,
+            α_exprs;
+            expression=Val{false},
+            cse=cse
         )
 
-        β_func_tuple = ModelingToolkit.Symbolics.build_function(
-            β_exprs,
-            states,
-            params,
-            iv,
-            expression=Val{false}
+        β_func_tuple = ModelingToolkit.build_function_wrapper(
+            sys,
+            β_exprs;
+            expression=Val{false},
+            cse=cse
         )
 
-        # Extract out-of-place versions
-        α_func = α_func_tuple[1]
-        β_func = β_func_tuple[1]
+        # Extract in-place versions (second element of tuple)
+        α_func_iip = α_func_tuple[2]
+        β_func_iip = β_func_tuple[2]
 
-        # Wrap to produce vector of (α, β) tuples
-        n_gating = length(gating_rate_exprs)
-
-        # Create a proper function instead of a closure
-        function gating_wrapper(gating_vars, u, p, t)
-            α_result = α_func(u, p, t)
-            β_result = β_func(u, p, t)
-            for i in 1:n_gating
-                gating_vars[i] = (α_result[i], β_result[i])
-            end
-        end
-
-        gating_f = gating_wrapper
+        # Use callable struct to avoid type instability
+        gating_f = GatingWrapper(α_func_iip, β_func_iip)
     end
 
     # Build non-gating function using Symbolics.build_function
     if isempty(non_gating_eqs)
         non_gating_f = (du, u, p, t) -> nothing
     else
-        non_gating_func = ModelingToolkit.Symbolics.build_function(
-            non_gating_eqs,
-            states,
-            params,
-            iv,
-            expression=Val{false}
+        # Build the function using ModelingToolkit's wrapper
+        non_gating_func = ModelingToolkit.build_function_wrapper(
+            sys,
+            non_gating_eqs;
+            expression=Val{false},
+            cse=cse
         )
 
-        # Wrap to write results to the correct indices in du
+        # Use IN-PLACE version to avoid allocations
+        # Pre-allocate buffer for non-gating results
+        n_non_gating = length(non_gating_eqs)
+        non_gating_buffer = zeros(n_non_gating)
+
         if non_gating_func isa Tuple
-            # Use out-of-place version and map to indices - extract function from tuple
-            base_func = non_gating_func[1]
-            non_gating_f = (du, u, p, t) -> begin
-                result = base_func(u, p, t)
-                for (i, idx) in enumerate(non_gating_idxs)
-                    du[idx] = result[i]
-                end
-            end
+            # Extract in-place version (second element)
+            base_func_iip = non_gating_func[2]
+            # Use callable struct to avoid type instability
+            non_gating_f = NonGatingWrapper(base_func_iip, non_gating_buffer, non_gating_idxs)
         else
-            # Out-of-place only version - capture in local variable
+            # Only out-of-place available (shouldn't happen with multiple expressions)
             base_func = non_gating_func
             non_gating_f = (du, u, p, t) -> begin
                 result = base_func(u, p, t)
@@ -268,12 +291,109 @@ function extract_alpha_beta_equations(gating_var, obs_subs)
 end
 
 """
+    extract_tau_inf_from_rhs(rhs, gating_var, obs_subs)
+
+Helper function to extract tau and inf from an expression of the form (g_inf - g) / tau.
+Handles both subtraction and addition with negation patterns.
+"""
+function extract_tau_inf_from_rhs(rhs, gating_var, obs_subs)
+    if !ModelingToolkit.Symbolics.istree(rhs)
+        error("Expected a symbolic tree expression")
+    end
+
+    op = ModelingToolkit.Symbolics.operation(rhs)
+    args = ModelingToolkit.Symbolics.arguments(rhs)
+
+    # Check if it's a division: (numerator) / (denominator)
+    if op != (/)
+        error("Expected division operation at top level")
+    end
+
+    numerator = args[1]
+    denominator = args[2]
+
+    if !ModelingToolkit.Symbolics.istree(numerator)
+        error("Expected numerator to be a symbolic tree")
+    end
+
+    num_op = ModelingToolkit.Symbolics.operation(numerator)
+    num_args = ModelingToolkit.Symbolics.arguments(numerator)
+
+    # Check if numerator is a subtraction: (g_inf - g)
+    if num_op == (-) && length(num_args) == 2
+        if ModelingToolkit.isequal(num_args[2], gating_var)
+            g_inf_expr = num_args[1]
+            tau_expr = denominator
+
+            # Substitute observed variables
+            g_inf_expr = substitute_observed_recursive(g_inf_expr, obs_subs)
+            tau_expr = substitute_observed_recursive(tau_expr, obs_subs)
+
+            return tau_expr, g_inf_expr
+        end
+    # Check if numerator is an addition: could be (g_inf + (-g)) or ((-g) + g_inf)
+    elseif num_op == (+) && length(num_args) == 2
+        first_arg = num_args[1]
+        second_arg = num_args[2]
+
+        # Check if second argument is negative of gating variable: (g_inf + (-g))
+        if ModelingToolkit.Symbolics.istree(second_arg)
+            op2 = ModelingToolkit.Symbolics.operation(second_arg)
+            args2 = ModelingToolkit.Symbolics.arguments(second_arg)
+
+            # Check for multiplication with -1 or unary negation
+            if (op2 == (*) && length(args2) == 2 &&
+                ((args2[1] == -1 && ModelingToolkit.isequal(args2[2], gating_var)) ||
+                 (args2[2] == -1 && ModelingToolkit.isequal(args2[1], gating_var)))) ||
+               (op2 == (-) && length(args2) == 1 && ModelingToolkit.isequal(args2[1], gating_var))
+
+                g_inf_expr = first_arg
+                tau_expr = denominator
+
+                # Substitute observed variables
+                g_inf_expr = substitute_observed_recursive(g_inf_expr, obs_subs)
+                tau_expr = substitute_observed_recursive(tau_expr, obs_subs)
+
+                return tau_expr, g_inf_expr
+            end
+        end
+
+        # Check if first argument is negative of gating variable: ((-g) + g_inf)
+        if ModelingToolkit.Symbolics.istree(first_arg)
+            op1 = ModelingToolkit.Symbolics.operation(first_arg)
+            args1 = ModelingToolkit.Symbolics.arguments(first_arg)
+
+            # Check for multiplication with -1 or unary negation
+            if (op1 == (*) && length(args1) == 2 &&
+                ((args1[1] == -1 && ModelingToolkit.isequal(args1[2], gating_var)) ||
+                 (args1[2] == -1 && ModelingToolkit.isequal(args1[1], gating_var)))) ||
+               (op1 == (-) && length(args1) == 1 && ModelingToolkit.isequal(args1[1], gating_var))
+
+                g_inf_expr = second_arg
+                tau_expr = denominator
+
+                # Substitute observed variables
+                g_inf_expr = substitute_observed_recursive(g_inf_expr, obs_subs)
+                tau_expr = substitute_observed_recursive(tau_expr, obs_subs)
+
+                return tau_expr, g_inf_expr
+            end
+        end
+    end
+
+    error("Could not extract tau and inf from expression for variable $(gating_var)")
+end
+
+"""
     extract_tau_inf_from_equation(eq, gating_var, obs_subs)
 
 Extract τ and g_inf directly from the structure of a tau-type gate equation.
 
 For a tau-type gate, the equation has the form:
     dg/dt = (g_inf - g) / tau_g
+
+Or with conditional evolution:
+    dg/dt = ifelse(condition, (g_inf - g) / tau_g, 0)
 
 This function parses this structure to extract tau_g and g_inf expressions.
 
@@ -288,88 +408,39 @@ This function parses this structure to extract tau_g and g_inf expressions.
 function extract_tau_inf_from_equation(eq, gating_var, obs_subs)
     rhs = eq.rhs
 
-    # The equation should be of the form: (g_inf - g) / tau
-    # or equivalently: g_inf/tau - g/tau
-    # Try to match the pattern (A - var) / B where A is g_inf and B is tau
-    # Using Symbolics pattern matching
+    # Check for ifelse pattern: ifelse(condition, (g_inf - g) / tau, 0)
+    # This represents a gating variable that only evolves under certain conditions
     if ModelingToolkit.Symbolics.istree(rhs)
         op = ModelingToolkit.Symbolics.operation(rhs)
         args = ModelingToolkit.Symbolics.arguments(rhs)
 
-        # Check if it's a division: (numerator) / (denominator)
-        if op == (/)
-            numerator = args[1]
-            denominator = args[2]
-            # The numerator should be (g_inf - g) which can be represented as:
-            # 1. Subtraction: (g_inf - g)
-            # 2. Addition with negative: (g_inf + (-g))
-            if ModelingToolkit.Symbolics.istree(numerator)
-                num_op = ModelingToolkit.Symbolics.operation(numerator)
-                num_args = ModelingToolkit.Symbolics.arguments(numerator)
+        # Handle ifelse at the top level
+        if op == ifelse && length(args) == 3
+            condition = args[1]
+            true_branch = args[2]
+            false_branch = args[3]
 
-                # Check if numerator is a subtraction: (g_inf - g)
-                if num_op == (-) && length(num_args) == 2
-                    # First term should be g_inf, second should be the gating variable
-                    if ModelingToolkit.isequal(num_args[2], gating_var)
-                        g_inf_expr = num_args[1]
-                        tau_expr = denominator
+            # Check if false branch is 0 (no evolution)
+            if false_branch == 0 || false_branch == 0.0
+                # Extract tau and inf from the true branch
+                tau_expr, inf_expr = extract_tau_inf_from_rhs(true_branch, gating_var, obs_subs)
 
-                        # Substitute observed variables
-                        g_inf_expr = substitute_observed_recursive(g_inf_expr, obs_subs)
-                        tau_expr = substitute_observed_recursive(tau_expr, obs_subs)
+                # Substitute observed variables in the condition
+                condition_substituted = substitute_observed_recursive(condition, obs_subs)
 
-                        return tau_expr, g_inf_expr
-                    end
-                # Check if numerator is an addition: could be (g_inf + (-g)) or ((-g) + g_inf)
-                elseif num_op == (+) && length(num_args) == 2
-                    first_arg = num_args[1]
-                    second_arg = num_args[2]
+                # Wrap them in ifelse to handle the condition
+                # When condition is false: tau = Inf (no change), inf = current value (g)
+                tau_expr_wrapped = ModelingToolkit.Symbolics.term(ifelse, condition_substituted, tau_expr, Inf)
+                inf_expr_wrapped = ModelingToolkit.Symbolics.term(ifelse, condition_substituted, inf_expr, gating_var)
 
-                    # Helper function to check if an expression is negative of the gating variable
-                    is_neg_gate = (expr) -> begin
-                        if ModelingToolkit.Symbolics.istree(expr)
-                            op = ModelingToolkit.Symbolics.operation(expr)
-                            args = ModelingToolkit.Symbolics.arguments(expr)
-
-                            # Check for multiplication with -1: (-1 * g) or (g * -1)
-                            if op == (*) && length(args) == 2
-                                return (args[1] == -1 && ModelingToolkit.isequal(args[2], gating_var)) ||
-                                       (args[2] == -1 && ModelingToolkit.isequal(args[1], gating_var))
-                            # Check for unary negation: -(g)
-                            elseif op == (-) && length(args) == 1
-                                return ModelingToolkit.isequal(args[1], gating_var)
-                            end
-                        end
-                        return false
-                    end
-
-                    # Check if second argument is negative of gating variable: (g_inf + (-g))
-                    if is_neg_gate(second_arg)
-                        g_inf_expr = first_arg
-                        tau_expr = denominator
-
-                        # Substitute observed variables
-                        g_inf_expr = substitute_observed_recursive(g_inf_expr, obs_subs)
-                        tau_expr = substitute_observed_recursive(tau_expr, obs_subs)
-
-                        return tau_expr, g_inf_expr
-                    # Check if first argument is negative of gating variable: ((-g) + g_inf)
-                    elseif is_neg_gate(first_arg)
-                        g_inf_expr = second_arg
-                        tau_expr = denominator
-
-                        # Substitute observed variables
-                        g_inf_expr = substitute_observed_recursive(g_inf_expr, obs_subs)
-                        tau_expr = substitute_observed_recursive(tau_expr, obs_subs)
-
-                        return tau_expr, g_inf_expr
-                    end
-                end
+                return tau_expr_wrapped, inf_expr_wrapped
             end
         end
     end
 
-    error("Could not extract tau and inf from equation structure for variable $(gating_var). Expected form: (g_inf - g) / tau")
+    # Standard case: (g_inf - g) / tau
+    # Use the helper function to extract
+    return extract_tau_inf_from_rhs(rhs, gating_var, obs_subs)
 end
 
 """
@@ -521,13 +592,17 @@ struct RushLarsenSystem
 end
 
 """
-    RushLarsenSystem(sys::System)
+    RushLarsenSystem(sys::System; simplify=true, cse=true)
 
 Create a RushLarsenSystem from a ModelingToolkit ODESystem.
 Automatically constructs the RushLarsenFunction internally.
+
+# Keyword Arguments
+- `simplify::Bool=true`: Whether to simplify symbolic expressions before code generation
+- `cse::Bool=true`: Whether to use common subexpression elimination in code generation
 """
-function RushLarsenSolvers.RushLarsenSystem(sys::ModelingToolkit.System)
-    rlf = RushLarsenFunction(sys)
+function RushLarsenSolvers.RushLarsenSystem(sys::ModelingToolkit.System; simplify::Bool=true, cse::Bool=true)
+    rlf = RushLarsenFunction(sys; simplify=simplify, cse=cse)
     return RushLarsenSystem(sys, rlf)
 end
 

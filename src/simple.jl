@@ -35,7 +35,12 @@ end
     else
         rl_f = f.f
     end
-    gating_vars_prototype = fill(ntuple(_ -> zero(eltype(u0)),2), length(rl_f.gating_idxs))
+    # Change gating_vars structure: instead of Vector{Tuple}, use Tuple{Vector, Vector}
+    # This avoids allocating tuples on every step
+    n_gating = length(rl_f.gating_idxs)
+    gating_vars_prototype = (zeros(eltype(u0), n_gating), zeros(eltype(u0), n_gating))
+    prev_gating_vars_prototype = (zeros(eltype(u0), n_gating), zeros(eltype(u0), n_gating))
+
     integ = RushLarsenIntegrator{IIP,S,T,P,F,typeof(gating_vars_prototype)}(f,
         copy(u0),
         copy(u0),
@@ -43,7 +48,7 @@ end
         #gating_vars
         gating_vars_prototype,
         #prev_gating_vars
-        gating_vars_prototype,
+        prev_gating_vars_prototype,
         t0,
         t0,
         t0,
@@ -57,10 +62,11 @@ end
 
 @inline @muladd function DiffEqBase.step!(integ::RushLarsenIntegrator{true, S, T}) where {T,S}
     integ.uprev .= integ.u
-    integ.prev_gating_vars .= integ.gating_vars
+    # Copy gating_vars to prev_gating_vars (both arrays in the tuple)
+    integ.prev_gating_vars[1] .= integ.gating_vars[1]
+    integ.prev_gating_vars[2] .= integ.gating_vars[2]
 
     @unpack tmp, f, p, t, dt, uprev, u, prev_gating_vars, gating_vars = integ
-
     if f isa RushLarsenFunction
         rl_f = f
     else
@@ -68,10 +74,10 @@ end
     end
     rl_f.gating_f(gating_vars, u, p, t)
 
+    # Now gating_vars is (α_array, β_array) or (tau_array, inf_array)
     for (i, k) in enumerate(rl_f.gating_idxs)
-        val1 = gating_vars[i][1]
-        val2 = gating_vars[i][2]
-
+        val1 = gating_vars[1][i]
+        val2 = gating_vars[2][i]
         # Check gate type if available
         if rl_f.gate_types !== nothing && i <= length(rl_f.gate_types) && rl_f.gate_types[i] == :tau
             # Tau-type gate: val1 = tau, val2 = g_inf
@@ -99,18 +105,16 @@ end
             end
         end
     end
-
     tmp .= u
-
     # Use Euler for non-gating equations
-    #Evaluate non gating variables with updated gating values
+    # Evaluate non gating variables with updated gating values
     rl_f.non_gating_f(u, tmp, p, t)
     for (i, k) in enumerate(rl_f.non_gating_idxs)
         u[k] = uprev[k] + dt * u[k]
     end
     integ.tprev = t
-    integ.t += dt 
-    
+    integ.t += dt
+
     return nothing
 end
 
