@@ -19,22 +19,20 @@ end
 DiffEqBase.isinplace(::RushLarsenIntegrator{IIP}) where {IIP} = IIP
 
 function DiffEqBase.__init(prob::ODEProblem, alg::RushLarsen; dt = error("dt is required for this algorithm"))
-    rushlarsen_init(DiffEqBase.unwrapped_f(prob.f), DiffEqBase.isinplace(prob),
+    rushlarsen_init(DiffEqBase.unwrapped_f(prob.f), Val(DiffEqBase.isinplace(prob)),
     prob.u0,
     prob.tspan[1],
     dt,
     prob.p)
 end
 
-@inline function rushlarsen_init(f::F, IIP::Bool, u0::S, t0::T, dt::T,
+@inline function rushlarsen_init(f::F, ::Val{IIP}, u0::S, t0::T, dt::T,
     p::P) where
-{F,P,T,S}
+{F,P,T,S,IIP}
 
-    if f isa RushLarsenFunction
-        rl_f = f
-    else
-        rl_f = f.f
-    end
+    # Type-stable extraction of RushLarsenFunction
+    rl_f = _get_rl_function(f)
+
     # Change gating_vars structure: instead of Vector{Tuple}, use Tuple{Vector, Vector}
     # This avoids allocating tuples on every step
     n_gating = length(rl_f.gating_idxs)
@@ -60,18 +58,15 @@ end
     return integ
 end
 
-@inline @muladd function DiffEqBase.step!(integ::RushLarsenIntegrator{true, S, T}) where {T,S}
+@inline @muladd function DiffEqBase.step!(integ::RushLarsenIntegrator{true, S, T, P, F, G}) where {T,S,P,F,G}
     integ.uprev .= integ.u
     # Copy gating_vars to prev_gating_vars (both arrays in the tuple)
     integ.prev_gating_vars[1] .= integ.gating_vars[1]
     integ.prev_gating_vars[2] .= integ.gating_vars[2]
 
     @unpack tmp, f, p, t, dt, uprev, u, prev_gating_vars, gating_vars = integ
-    if f isa RushLarsenFunction
-        rl_f = f
-    else
-        rl_f = f.f
-    end
+    # Type-stable extraction of RushLarsenFunction
+    rl_f = _get_rl_function(f)
     rl_f.gating_f(gating_vars, u, p, t)
 
     # Now gating_vars is (α_array, β_array) or (tau_array, inf_array)
@@ -118,18 +113,17 @@ end
     return nothing
 end
 
-@inline @muladd function DiffEqBase.step!(integ::RushLarsenIntegrator{false,S,T}) where {T,S}
+@inline @muladd function DiffEqBase.step!(integ::RushLarsenIntegrator{false,S,T,P,F,G}) where {T,S,P,F,G}
     integ.uprev = integ.u
     @unpack tmp, f, p, t, dt, uprev, u = integ
 
-    if f isa ODEFunction
-        f = f.f
-    end
+    # Type-stable extraction of RushLarsenFunction
+    rl_f = _get_rl_function(f)
 
-    gating_idxs = f.gating_idxs
-    non_gating_idxs = f.non_gating_idxs
-    
-    gating_vars = f.gating_f(uprev,p,t)
+    gating_idxs = rl_f.gating_idxs
+    non_gating_idxs = rl_f.non_gating_idxs
+
+    gating_vars = rl_f.gating_f(uprev,p,t)
 
     for (i,k) in enumerate(gating_idxs)
         alpha_i = gating_vars[i][1] 
@@ -148,7 +142,7 @@ end
 
     # Use Euler for non-gating equations
     # First need to do a function evaluation with updated gating variables
-    dudt = f.non_gating_f(integ.u,p,t)
+    dudt = rl_f.non_gating_f(integ.u,p,t)
 
     for (i,k) in enumerate(non_gating_idxs)
         u[i] = uprev[i] + dt*dudt[k]

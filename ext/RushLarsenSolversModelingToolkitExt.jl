@@ -24,7 +24,7 @@ end
     @inbounds for (i, idx) in enumerate(wrapper.non_gating_idxs)
         du[idx] = wrapper.buffer[i]
     end
-    return nothing
+    return du
 end
 
 # Callable struct for gating functions to avoid type instability
@@ -36,7 +36,7 @@ end
 @inline function (wrapper::GatingWrapper)(gating_vars, u, p, t)
     wrapper.α_func(gating_vars[1], u, p, t)
     wrapper.β_func(gating_vars[2], u, p, t)
-    return nothing
+    return gating_vars
 end
 
 RushLarsenSolvers.is_tau_variable(var::ModelingToolkit.Symbolics.BasicSymbolic) = ModelingToolkit.Symbolics.hasmetadata(var, TauGate)
@@ -155,25 +155,29 @@ function RushLarsenSolvers.RushLarsenFunction(sys::ModelingToolkit.System; simpl
         α_exprs = [pair[1] for pair in gating_rate_exprs]
         β_exprs = [pair[2] for pair in gating_rate_exprs]
 
-        # Build IN-PLACE functions to avoid allocations
-        # Use ModelingToolkit's build_function_wrapper for better code generation
-        α_func_tuple = ModelingToolkit.build_function_wrapper(
-            sys,
-            α_exprs;
-            expression=Val{false},
+        # Build IN-PLACE functions using RuntimeGeneratedFunction
+        # Now that parameters are Vector{Float64} (not Vector{Real}), this should be type-stable
+        α_func_exprs = ModelingToolkit.Symbolics.build_function(
+            α_exprs,
+            states,
+            params,
+            iv,
+            expression=Val{false},  # Use RuntimeGeneratedFunction
             cse=cse
         )
 
-        β_func_tuple = ModelingToolkit.build_function_wrapper(
-            sys,
-            β_exprs;
-            expression=Val{false},
+        β_func_exprs = ModelingToolkit.Symbolics.build_function(
+            β_exprs,
+            states,
+            params,
+            iv,
+            expression=Val{false},  # Use RuntimeGeneratedFunction
             cse=cse
         )
 
-        # Extract in-place versions (second element of tuple)
-        α_func_iip = α_func_tuple[2]
-        β_func_iip = β_func_tuple[2]
+        # Extract the in-place versions (second element of tuple)
+        α_func_iip = α_func_exprs[2]
+        β_func_iip = β_func_exprs[2]
 
         # Use callable struct to avoid type instability
         gating_f = GatingWrapper(α_func_iip, β_func_iip)
@@ -183,34 +187,27 @@ function RushLarsenSolvers.RushLarsenFunction(sys::ModelingToolkit.System; simpl
     if isempty(non_gating_eqs)
         non_gating_f = (du, u, p, t) -> nothing
     else
-        # Build the function using ModelingToolkit's wrapper
-        non_gating_func = ModelingToolkit.build_function_wrapper(
-            sys,
-            non_gating_eqs;
-            expression=Val{false},
+        # Build the function using RuntimeGeneratedFunction
+        # Now that parameters are Vector{Float64} (not Vector{Real}), this should be type-stable
+        non_gating_func_exprs = ModelingToolkit.Symbolics.build_function(
+            non_gating_eqs,
+            states,
+            params,
+            iv,
+            expression=Val{false},  # Use RuntimeGeneratedFunction
             cse=cse
         )
+
+        # Extract the in-place version (second element of tuple)
+        base_func_iip = non_gating_func_exprs[2]
 
         # Use IN-PLACE version to avoid allocations
         # Pre-allocate buffer for non-gating results
         n_non_gating = length(non_gating_eqs)
         non_gating_buffer = zeros(n_non_gating)
 
-        if non_gating_func isa Tuple
-            # Extract in-place version (second element)
-            base_func_iip = non_gating_func[2]
-            # Use callable struct to avoid type instability
-            non_gating_f = NonGatingWrapper(base_func_iip, non_gating_buffer, non_gating_idxs)
-        else
-            # Only out-of-place available (shouldn't happen with multiple expressions)
-            base_func = non_gating_func
-            non_gating_f = (du, u, p, t) -> begin
-                result = base_func(u, p, t)
-                for (i, idx) in enumerate(non_gating_idxs)
-                    du[idx] = result[i]
-                end
-            end
-        end
+        # Use callable struct to avoid type instability
+        non_gating_f = NonGatingWrapper(base_func_iip, non_gating_buffer, non_gating_idxs)
     end
 
     return RushLarsenSolvers.RushLarsenFunction(gating_f, non_gating_f, gating_idxs, non_gating_idxs, gate_types)
