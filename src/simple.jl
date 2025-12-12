@@ -69,6 +69,13 @@ end
     rl_f = _get_rl_function(f)
     rl_f.gating_f(gating_vars, u, p, t)
 
+    # Diagnostic: check for NaN after gating_f call
+    if any(isnan, gating_vars[1]) || any(isnan, gating_vars[2])
+        println("⚠️  NaN in gating_f output at t=$t")
+        println("   tau NaN indices: ", findall(isnan, gating_vars[1]))
+        println("   inf NaN indices: ", findall(isnan, gating_vars[2]))
+    end
+
     # Now gating_vars is (α_array, β_array) or (tau_array, inf_array)
     for (i, k) in enumerate(rl_f.gating_idxs)
         val1 = gating_vars[1][i]
@@ -78,9 +85,10 @@ end
             # Tau-type gate: val1 = tau, val2 = g_inf
             tau = val1
             u_inf = val2
-            if tau < 1e-14
-                # Handle special case to avoid division by zero
-                u[k] = u_inf  # Instantaneous jump to steady state
+            if tau < 1e-14 || dt / tau > 10.0
+                # Handle special case: very small tau or large dt/tau ratio
+                # Jump to steady state to avoid numerical issues
+                u[k] = u_inf
             else
                 u[k] = u_inf + (uprev[k] - u_inf) * exp(-dt / tau)
             end
@@ -100,13 +108,33 @@ end
             end
         end
     end
+    # Diagnostic: check for NaN after gating update
+    if any(isnan, u)
+        println("⚠️  NaN in u after gating update at t=$t")
+        println("   NaN indices: ", findall(isnan, u))
+    end
+
     tmp .= u
     # Use Euler for non-gating equations
     # Evaluate non gating variables with updated gating values
     rl_f.non_gating_f(u, tmp, p, t)
+
+    # Diagnostic: check for NaN after non_gating_f
+    if any(isnan, u)
+        println("⚠️  NaN in u after non_gating_f at t=$t")
+        println("   NaN indices: ", findall(isnan, u))
+    end
+
     for (i, k) in enumerate(rl_f.non_gating_idxs)
         u[k] = uprev[k] + dt * u[k]
     end
+
+    # Diagnostic: check for NaN after Euler step
+    if any(isnan, u)
+        println("⚠️  NaN in u after Euler step at t=$t")
+        println("   NaN indices: ", findall(isnan, u))
+    end
+
     integ.tprev = t
     integ.t += dt
 
@@ -164,7 +192,7 @@ function DiffEqBase.__solve(prob::ODEProblem, alg::RushLarsen;
 
     @inbounds us[1] = copy(u0)
 
-    integ = rushlarsen_init(DiffEqBase.unwrapped_f(prob.f), DiffEqBase.isinplace(prob), prob.u0,
+    integ = rushlarsen_init(DiffEqBase.unwrapped_f(prob.f), Val(DiffEqBase.isinplace(prob)), prob.u0,
         prob.tspan[1], dt, prob.p)
 
     for i in 1:(n-1)
@@ -185,6 +213,10 @@ end
     non_gating_idxs
     gate_types  # Vector of :tau or :alpha_beta symbols
 end
+
+# Type-stable helper functions to extract RushLarsenFunction
+@inline _get_rl_function(f::RushLarsenFunction) = f
+@inline _get_rl_function(f) = f.f
 
 function RushLarsenFunction(gating_f, non_gating_f; gating_idxs = nothing, non_gating_idxs = nothing, gate_types = nothing)
     RushLarsenFunction(gating_f, non_gating_f, gating_idxs, non_gating_idxs, gate_types)
