@@ -68,14 +68,7 @@ end
     # Type-stable extraction of RushLarsenFunction
     rl_f = _get_rl_function(f)
     rl_f.gating_f(gating_vars, u, p, t)
-
-    # Diagnostic: check for NaN after gating_f call
-    if any(isnan, gating_vars[1]) || any(isnan, gating_vars[2])
-        println("⚠️  NaN in gating_f output at t=$t")
-        println("   tau NaN indices: ", findall(isnan, gating_vars[1]))
-        println("   inf NaN indices: ", findall(isnan, gating_vars[2]))
-    end
-
+    
     # Now gating_vars is (α_array, β_array) or (tau_array, inf_array)
     for (i, k) in enumerate(rl_f.gating_idxs)
         val1 = gating_vars[1][i]
@@ -108,31 +101,14 @@ end
             end
         end
     end
-    # Diagnostic: check for NaN after gating update
-    if any(isnan, u)
-        println("⚠️  NaN in u after gating update at t=$t")
-        println("   NaN indices: ", findall(isnan, u))
-    end
 
     tmp .= u
     # Use Euler for non-gating equations
     # Evaluate non gating variables with updated gating values
     rl_f.non_gating_f(u, tmp, p, t)
 
-    # Diagnostic: check for NaN after non_gating_f
-    if any(isnan, u)
-        println("⚠️  NaN in u after non_gating_f at t=$t")
-        println("   NaN indices: ", findall(isnan, u))
-    end
-
     for (i, k) in enumerate(rl_f.non_gating_idxs)
         u[k] = uprev[k] + dt * u[k]
-    end
-
-    # Diagnostic: check for NaN after Euler step
-    if any(isnan, u)
-        println("⚠️  NaN in u after Euler step at t=$t")
-        println("   NaN indices: ", findall(isnan, u))
     end
 
     integ.tprev = t
