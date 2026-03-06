@@ -19,23 +19,26 @@ end
 DiffEqBase.isinplace(::RushLarsenIntegrator{IIP}) where {IIP} = IIP
 
 function DiffEqBase.__init(prob::ODEProblem, alg::RushLarsen; dt = error("dt is required for this algorithm"))
-    rushlarsen_init(DiffEqBase.unwrapped_f(prob.f), DiffEqBase.isinplace(prob),
+    rushlarsen_init(DiffEqBase.unwrapped_f(prob.f), Val(DiffEqBase.isinplace(prob)),
     prob.u0,
     prob.tspan[1],
     dt,
     prob.p)
 end
 
-@inline function rushlarsen_init(f::F, IIP::Bool, u0::S, t0::T, dt::T,
+@inline function rushlarsen_init(f::F, ::Val{IIP}, u0::S, t0::T, dt::T,
     p::P) where
-{F,P,T,S}
+{F,P,T,S,IIP}
 
-    if f isa RushLarsenFunction
-        rl_f = f
-    else
-        rl_f = f.f
-    end
-    gating_vars_prototype = fill(ntuple(_ -> zero(eltype(u0)),2), length(rl_f.gating_idxs))
+    # Type-stable extraction of RushLarsenFunction
+    rl_f = _get_rl_function(f)
+
+    # Change gating_vars structure: instead of Vector{Tuple}, use Tuple{Vector, Vector}
+    # This avoids allocating tuples on every step
+    n_gating = length(rl_f.gating_idxs)
+    gating_vars_prototype = (zeros(eltype(u0), n_gating), zeros(eltype(u0), n_gating))
+    prev_gating_vars_prototype = (zeros(eltype(u0), n_gating), zeros(eltype(u0), n_gating))
+
     integ = RushLarsenIntegrator{IIP,S,T,P,F,typeof(gating_vars_prototype)}(f,
         copy(u0),
         copy(u0),
@@ -43,7 +46,7 @@ end
         #gating_vars
         gating_vars_prototype,
         #prev_gating_vars
-        gating_vars_prototype,
+        prev_gating_vars_prototype,
         t0,
         t0,
         t0,
@@ -55,61 +58,76 @@ end
     return integ
 end
 
-@inline @muladd function DiffEqBase.step!(integ::RushLarsenIntegrator{true, S, T}) where {T,S}
+@inline @muladd function DiffEqBase.step!(integ::RushLarsenIntegrator{true, S, T, P, F, G}) where {T,S,P,F,G}
     integ.uprev .= integ.u
-    integ.prev_gating_vars .= integ.gating_vars
+    # Copy gating_vars to prev_gating_vars (both arrays in the tuple)
+    integ.prev_gating_vars[1] .= integ.gating_vars[1]
+    integ.prev_gating_vars[2] .= integ.gating_vars[2]
 
     @unpack tmp, f, p, t, dt, uprev, u, prev_gating_vars, gating_vars = integ
-
-    if f isa RushLarsenFunction
-        rl_f = f
-    else
-        rl_f = f.f
-    end
-
+    # Type-stable extraction of RushLarsenFunction
+    rl_f = _get_rl_function(f)
     rl_f.gating_f(gating_vars, u, p, t)
-
+    
+    # Now gating_vars is (α_array, β_array) or (tau_array, inf_array)
     for (i, k) in enumerate(rl_f.gating_idxs)
-        alpha_i = gating_vars[i][1]
-        beta_i = gating_vars[i][2]
-        # Rush-Larsen formula: u_new = u_inf + (u_old - u_inf) * exp(-dt/tau)
-        # where u_inf = alpha/(alpha+beta) and tau = 1/(alpha+beta)
-        if alpha_i + beta_i < 1e-14
-            # Handle special case to avoid division by zero
-            u[k] = uprev[k]
+        val1 = gating_vars[1][i]
+        val2 = gating_vars[2][i]
+        # Check gate type if available
+        if rl_f.gate_types !== nothing && i <= length(rl_f.gate_types) && rl_f.gate_types[i] == :tau
+            # Tau-type gate: val1 = tau, val2 = g_inf
+            tau = val1
+            u_inf = val2
+            if tau < 1e-14 || dt / tau > 10.0
+                # Handle special case: very small tau or large dt/tau ratio
+                # Jump to steady state to avoid numerical issues
+                u[k] = u_inf
+            else
+                u[k] = u_inf + (uprev[k] - u_inf) * exp(-dt / tau)
+            end
         else
-            u_inf = alpha_i / (alpha_i + beta_i)
-            tau = 1 / (alpha_i + beta_i)
-            u[k] = u_inf + (uprev[k] - u_inf) * exp(-dt / tau)
+            # Alpha-beta gate: val1 = alpha, val2 = beta
+            alpha_i = val1
+            beta_i = val2
+            # Rush-Larsen formula: u_new = u_inf + (u_old - u_inf) * exp(-dt/tau)
+            # where u_inf = alpha/(alpha+beta) and tau = 1/(alpha+beta)
+            if alpha_i + beta_i < 1e-14
+                # Handle special case to avoid division by zero
+                u[k] = uprev[k]
+            else
+                u_inf = alpha_i / (alpha_i + beta_i)
+                tau = 1 / (alpha_i + beta_i)
+                u[k] = u_inf + (uprev[k] - u_inf) * exp(-dt / tau)
+            end
         end
     end
 
     tmp .= u
-
     # Use Euler for non-gating equations
-    #Evaluate non gating variables with updated gating values
+    # Evaluate non gating variables with updated gating values
     rl_f.non_gating_f(u, tmp, p, t)
+
     for (i, k) in enumerate(rl_f.non_gating_idxs)
         u[k] = uprev[k] + dt * u[k]
     end
+
     integ.tprev = t
-    integ.t += dt 
-    
+    integ.t += dt
+
     return nothing
 end
 
-@inline @muladd function DiffEqBase.step!(integ::RushLarsenIntegrator{false,S,T}) where {T,S}
+@inline @muladd function DiffEqBase.step!(integ::RushLarsenIntegrator{false,S,T,P,F,G}) where {T,S,P,F,G}
     integ.uprev = integ.u
     @unpack tmp, f, p, t, dt, uprev, u = integ
 
-    if f isa ODEFunction
-        f = f.f
-    end
+    # Type-stable extraction of RushLarsenFunction
+    rl_f = _get_rl_function(f)
 
-    gating_idxs = f.gating_idxs
-    non_gating_idxs = f.non_gating_idxs
-    
-    gating_vars = f.gating_f(uprev,p,t)
+    gating_idxs = rl_f.gating_idxs
+    non_gating_idxs = rl_f.non_gating_idxs
+
+    gating_vars = rl_f.gating_f(uprev,p,t)
 
     for (i,k) in enumerate(gating_idxs)
         alpha_i = gating_vars[i][1] 
@@ -128,7 +146,7 @@ end
 
     # Use Euler for non-gating equations
     # First need to do a function evaluation with updated gating variables
-    dudt = f.non_gating_f(integ.u,p,t)
+    dudt = rl_f.non_gating_f(integ.u,p,t)
 
     for (i,k) in enumerate(non_gating_idxs)
         u[i] = uprev[i] + dt*dudt[k]
@@ -150,7 +168,7 @@ function DiffEqBase.__solve(prob::ODEProblem, alg::RushLarsen;
 
     @inbounds us[1] = copy(u0)
 
-    integ = rushlarsen_init(DiffEqBase.unwrapped_f(prob.f), DiffEqBase.isinplace(prob), prob.u0,
+    integ = rushlarsen_init(DiffEqBase.unwrapped_f(prob.f), Val(DiffEqBase.isinplace(prob)), prob.u0,
         prob.tspan[1], dt, prob.p)
 
     for i in 1:(n-1)
@@ -169,10 +187,15 @@ end
 
     gating_idxs
     non_gating_idxs
+    gate_types  # Vector of :tau or :alpha_beta symbols
 end
 
-function RushLarsenFunction(gating_f, non_gating_f; gating_idxs = nothing, non_gating_idxs = nothing)
-    RushLarsenFunction(gating_f, non_gating_f, gating_idxs, non_gating_idxs)
+# Type-stable helper functions to extract RushLarsenFunction
+@inline _get_rl_function(f::RushLarsenFunction) = f
+@inline _get_rl_function(f) = f.f
+
+function RushLarsenFunction(gating_f, non_gating_f; gating_idxs = nothing, non_gating_idxs = nothing, gate_types = nothing)
+    RushLarsenFunction(gating_f, non_gating_f, gating_idxs, non_gating_idxs, gate_types)
 end
 
 # For compatibility with other ODE solvers
@@ -183,14 +206,22 @@ function (f::RushLarsenFunction)(u,p,t)
     gating_vars = f.gating_f(u,p,t)
     for (i,k) in enumerate(f.gating_idxs)
         # alpha, beta = gating_vars[i]
-        du[k] = gating_var[i][1]*(1 - u[k]) - gating_vars[i][2]*u[k]
+        du[k] = gating_vars[i][1]*(1 - u[k]) - gating_vars[i][2]*u[k]
     end
-    
+
     du[f.non_gating_idxs] .= f.non_gating_f(u,p,t)
-    
+
     du
 end
 
 function (f::RushLarsenFunction)(du,u,p,t)
+    gating_vars = f.gating_f(u,p,t)
+    for (i,k) in enumerate(f.gating_idxs)
+        # alpha, beta = gating_vars[i]
+        du[k] = gating_vars[i][1]*(1 - u[k]) - gating_vars[i][2]*u[k]
+    end
 
+    du[f.non_gating_idxs] .= f.non_gating_f(u,p,t)
+
+    return nothing
 end

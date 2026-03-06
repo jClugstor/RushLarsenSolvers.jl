@@ -29,7 +29,7 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 test = ["Test"]
 
 [weakdeps]
-MTKCardiacCellModels = "cf70e313-3958-40e5-b5fe-3d717db61409"
+ModelingToolkit = "961ee093-0014-501f-94e3-6117800e7a78"
 
 [extensions]
-RushLarsenSolversMTKCardiacCellModelsExt = "MTKCardiacCellModels"
+RushLarsenSolversModelingToolkitExt = "ModelingToolkit"
