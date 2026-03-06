@@ -1,16 +1,20 @@
 module RushLarsenSolversModelingToolkitExt
 
 using RushLarsenSolvers
-import RushLarsenSolvers: RushLarsenFunction
+import RushLarsenSolvers: RushLarsenFunction, get_markov_chain_id
 using RushLarsenSolvers: is_gating_variable
 using ModelingToolkit
+using BlockDiagonals
 import ModelingToolkit.SymbolicIndexingInterface as SymbolicIndexingInterface
 
 struct AlphaBetaGate <: ModelingToolkit.Symbolics.AbstractVariableMetadata end
 struct TauGate <: ModelingToolkit.Symbolics.AbstractVariableMetadata end
+struct MarkovGate <: ModelingToolkit.Symbolics.AbstractVariableMetadata end 
 
 ModelingToolkit.Symbolics.option_to_metadata_type(::Val{:tau_gate}) = TauGate
 ModelingToolkit.Symbolics.option_to_metadata_type(::Val{:alpha_beta_gate}) = AlphaBetaGate
+# MarkovGate metadata is just the chain_id Symbol
+ModelingToolkit.Symbolics.option_to_metadata_type(::Val{:markov_gate}) = MarkovGate
 
 # Callable struct to avoid type instability in closures
 struct NonGatingWrapper{F,B<:AbstractVector,I<:AbstractVector{Int}}
@@ -41,8 +45,42 @@ end
 
 RushLarsenSolvers.is_tau_variable(var::ModelingToolkit.Symbolics.BasicSymbolic) = ModelingToolkit.Symbolics.hasmetadata(var, TauGate)
 RushLarsenSolvers.is_alphabeta_variable(var::ModelingToolkit.Symbolics.BasicSymbolic) = ModelingToolkit.Symbolics.hasmetadata(var, AlphaBetaGate)
-RushLarsenSolvers.is_gating_variable(var::ModelingToolkit.Symbolics.BasicSymbolic) = RushLarsenSolvers.is_tau_variable(var) || RushLarsenSolvers.is_alphabeta_variable(var)
+RushLarsenSolvers.is_markov_gate(var::ModelingToolkit.Symbolics.BasicSymbolic) = ModelingToolkit.Symbolics.hasmetadata(var, MarkovGate)
+RushLarsenSolvers.is_gating_variable(var::ModelingToolkit.Symbolics.BasicSymbolic) = RushLarsenSolvers.is_tau_variable(var) || RushLarsenSolvers.is_alphabeta_variable(var) || RushLarsenSolvers.is_markov_gate(var)
 
+"""
+    get_markov_chain_id(var)
+
+Get the chain_id for a Markov gate variable. Returns the Symbol identifying which chain this gate belongs to.
+Returns `nothing` if the variable is not a Markov gate.
+"""
+function get_markov_chain_id(var::ModelingToolkit.Symbolics.BasicSymbolic)
+    # When using [markov_gate = "ikr"], the value is stored as a String
+    # This avoids the QuoteNode wrapping issue that occurs with Symbols
+    if !ModelingToolkit.Symbolics.hasmetadata(var, MarkovGate)
+        return nothing
+    end
+
+    # Get the metadata value - should be a String like "ikr"
+    chain_id = ModelingToolkit.Symbolics.getmetadata(var, MarkovGate, nothing)
+
+    # Convert String to Symbol for consistency
+    if chain_id isa String
+        return Symbol(chain_id)
+    end
+
+    # Legacy support: Handle QuoteNode if someone used Symbol syntax
+    if chain_id isa QuoteNode
+        return chain_id.value
+    end
+
+    # If it's already a Symbol
+    if chain_id isa Symbol
+        return chain_id
+    end
+
+    return nothing
+end
 
 # ============================================================================
 # RushLarsenFunction Constructor from ModelingToolkit System
@@ -459,6 +497,399 @@ function substitute_observed_recursive(expr, obs_subs)
         prev_expr = new_expr
     end
     return prev_expr
+end
+
+"""
+    extract_markov_structure(markov_vars, eqs, obs_subs)
+
+Extract the linear structure from Markov chain gate equations.
+
+For Markov gates with equations like:
+    D(c0) ~ c1 * beta_ikr - c0 * alpha
+    D(c1) ~ (c0 * alpha + c2 * beta1) - c1 * (beta_ikr + alpha1)
+    ...
+
+This function identifies:
+1. Which variables belong to the same Markov chain (appear in each other's equations)
+2. Extracts the coefficient of each state variable (represents Q matrix structure)
+
+Returns a dictionary mapping each Markov state to:
+- The list of states in its chain
+- The symbolic expression for its derivative
+
+# Arguments
+- `markov_vars`: Vector of variables marked as Markov gates
+- `eqs`: System equations
+- `obs_subs`: Observed variable substitutions
+
+# Returns
+Dictionary mapping state variables to their Markov chain information
+"""
+function extract_markov_structure(markov_vars, eqs, obs_subs)
+    # Group Markov variables into chains (variables that couple to each other)
+    # For now, we'll return the equations in linear form
+    markov_info = Dict()
+
+    for var in markov_vars
+        # Find the equation for this variable
+        eq = nothing
+        for e in eqs
+            if ModelingToolkit.isequal(ModelingToolkit.arguments(e.lhs)[1], var)
+                eq = e
+                break
+            end
+        end
+
+        if eq === nothing
+            error("Could not find equation for Markov gate variable $var")
+        end
+
+        # Substitute observed variables
+        rhs_substituted = substitute_observed_recursive(eq.rhs, obs_subs)
+
+        # Store the RHS expression - this represents the linear combination
+        # D(state) = sum of (rate * other_state) terms
+        markov_info[var] = rhs_substituted
+    end
+
+    return markov_info
+end
+
+# ============================================================================
+# GRLFunction Constructor from ModelingToolkit System
+# ============================================================================
+
+"""
+    RushLarsenSolvers.GRLFunction(sys::ODESystem; simplify=true, cse=true)
+
+Construct a GRLFunction from a ModelingToolkit ODESystem for use with generalized
+Rush-Larsen methods (e.g., RL1).
+
+This constructor automatically:
+1. Identifies HH-type gates (alpha-beta or tau-inf) and Markov chain gates
+2. Groups Markov gates into chains (gates that couple to each other)
+3. Builds `a(u,p,t)` as a BlockDiagonal matrix where:
+   - Each HH gate gets a 1×1 block with a = -(α+β) or a = -1/τ
+   - Each Markov chain gets an n×n block with the Q transition matrix
+4. Builds `b(u,p,t)` as a vector where:
+   - Each HH gate gets b = α or b = g_inf/τ
+   - Each Markov chain state gets b = 0
+
+# Arguments
+- `sys::ODESystem`: A ModelingToolkit ODESystem with gating variables marked
+
+# Keyword Arguments
+- `simplify::Bool=true`: Whether to simplify symbolic expressions before code generation
+- `cse::Bool=true`: Whether to use common subexpression elimination in code generation
+
+# Returns
+- `GRLFunction`: A function object for use with RL1 or other generalized RL algorithms
+
+# Example
+```julia
+# Mark variables with metadata
+@variables begin
+    m(t), [alpha_beta_gate = true]
+    h(t), [alpha_beta_gate = true]
+    # IKr Markov chain - use markov_gate = "chain_id" (String)
+    c0(t), [markov_gate = "ikr"]
+    c1(t), [markov_gate = "ikr"]
+    o(t), [markov_gate = "ikr"]
+    # INa Markov chain (if you have multiple chains)
+    c0_na(t), [markov_gate = "ina"]
+    c1_na(t), [markov_gate = "ina"]
+end
+
+# Define equations for each chain...
+@equations begin
+    # HH gates
+    D(m) ~ ...
+    D(h) ~ ...
+    # IKr Markov chain
+    D(c0) ~ c1 * beta_ikr - c0 * alpha
+    D(c1) ~ c0 * alpha - c1 * beta_ikr + o * beta2 - c1 * alpha2
+    D(o) ~ c1 * alpha2 - o * beta2
+    # INa Markov chain
+    D(c0_na) ~ ...
+    D(c1_na) ~ ...
+end
+
+sys = ODESystem(eqs, t, vars, params)
+grl_f = GRLFunction(sys)
+
+# Use with RL1
+prob = ODEProblem(grl_f, u0, tspan, p)
+sol = solve(prob, RL1(), dt=0.1)
+```
+
+# Notes
+- Each Markov gate must have a `chain_id` specified via `markov_gate = "chain_name"` (use String, not Symbol)
+- Gates with the same `chain_id` are grouped into a single n×n Q matrix block
+- Different chains get separate blocks in the BlockDiagonal matrix
+- This allows multiple independent Markov chains in the same system
+"""
+function RushLarsenSolvers.GRLFunction(sys::ModelingToolkit.System; simplify::Bool=true, cse::Bool=true)
+    # Get system information
+    eqs = ModelingToolkit.equations(sys)
+    states = ModelingToolkit.unknowns(sys)
+    params = ModelingToolkit.parameters(sys)
+    iv = ModelingToolkit.get_iv(sys)
+
+    # Get observed equations
+    observed_eqs = ModelingToolkit.observed(sys)
+    obs_subs = Dict(eq.lhs => eq.rhs for eq in observed_eqs)
+
+    # Separate gating variables by type
+    hh_gates = []  # HH-style gates (alpha-beta or tau-inf)
+    markov_gates = []  # Markov chain gates
+    non_gating = []  # Non-gating variables
+
+    for (i, state) in enumerate(states)
+        if RushLarsenSolvers.is_markov_gate(state)
+            push!(markov_gates, (i, state))
+        elseif is_gating_variable(state)
+            push!(hh_gates, (i, state))
+        else
+            push!(non_gating, (i, state))
+        end
+    end
+
+    # Group Markov gates into chains based on chain_id
+    markov_chains_dict = Dict{Symbol, Vector{Tuple{Int, Any}}}()
+
+    for (idx, state) in markov_gates
+        chain_id = get_markov_chain_id(state)
+        if chain_id === nothing
+            error("Markov gate variable $state does not have a chain_id. " *
+                  "Please specify chain_id when marking variables, e.g., [markov_gate = :ikr]")
+        end
+
+        if !haskey(markov_chains_dict, chain_id)
+            markov_chains_dict[chain_id] = []
+        end
+        push!(markov_chains_dict[chain_id], (idx, state))
+    end
+
+    # Convert to vector of chains (sorted by chain_id for deterministic ordering)
+    markov_chains = [markov_chains_dict[key] for key in sort(collect(keys(markov_chains_dict)))]
+
+    # Build block structure:
+    # CRITICAL: BlockDiagonal expects blocks that correspond to contiguous groups of states
+    # For Markov chains with states at indices i:i+n-1, we need ONE n×n block
+    # We can't iterate state-by-state; we need to identify contiguous groups
+    n_total = length(states)
+
+    # Create a mapping from state index to its classification
+    state_classification = Dict{Int, Tuple{Symbol, Any}}()  # index => (:hh_gate | :markov_chain | :non_gating, details)
+
+    for (idx, state) in hh_gates
+        state_classification[idx] = (:hh_gate, state)
+    end
+
+    # For Markov chains, all states in a chain get marked with the same chain object
+    for (chain_idx, chain) in enumerate(markov_chains)
+        for (idx, state) in chain
+            state_classification[idx] = (:markov_chain, (chain_idx, chain))
+        end
+    end
+
+    for (idx, state) in non_gating
+        state_classification[idx] = (:non_gating, state)
+    end
+
+    # Build list of (start_idx, end_idx, type, details) for contiguous groups
+    groups = []  # Will store: (start_idx, end_idx, :type, details)
+    idx = 1
+    while idx <= n_total
+        if !haskey(state_classification, idx)
+            error("State at index $idx not classified")
+        end
+
+        state_type, details = state_classification[idx]
+
+        if state_type == :markov_chain
+            # Markov chain - find the full extent of this chain
+            chain_idx, chain = details
+            chain_indices = sort([i for (i, _) in chain])
+            start_idx = chain_indices[1]
+            end_idx = chain_indices[end]
+
+            # Verify chain is contiguous
+            if chain_indices != collect(start_idx:end_idx)
+                error("Markov chain states are not contiguous: $chain_indices")
+            end
+
+            push!(groups, (start_idx, end_idx, :markov_chain, chain))
+            idx = end_idx + 1  # Skip to after this chain
+        else
+            # HH gate or non-gating: single state
+            push!(groups, (idx, idx, state_type, details))
+            idx += 1
+        end
+    end
+
+    # Extract symbolic expressions for a and b based on groups
+    a_blocks = Matrix{ModelingToolkit.Num}[]
+    b_exprs = fill(ModelingToolkit.Num(0), n_total)
+
+    for (start_idx, end_idx, group_type, details) in groups
+        if group_type == :hh_gate
+            state = details
+            # Process HH gate
+            if RushLarsenSolvers.is_tau_variable(state)
+                # Tau-type: a = -1/τ, b = g_inf/τ
+                eq = find_equation_for_variable(eqs, state, sys)
+                tau_expr, inf_expr = extract_tau_inf_from_equation(eq, state, obs_subs)
+
+                a_expr = -1 / tau_expr
+                b_expr = inf_expr / tau_expr
+            else
+                # Alpha-beta: a = -(α+β), b = α
+                α_expr, β_expr = extract_alpha_beta_equations(state, obs_subs)
+                α_expr = substitute_observed_recursive(α_expr, obs_subs)
+                β_expr = substitute_observed_recursive(β_expr, obs_subs)
+
+                a_expr = -(α_expr + β_expr)
+                b_expr = α_expr
+            end
+
+            # Create 1×1 matrix block
+            block = Matrix{ModelingToolkit.Num}(undef, 1, 1)
+            block[1, 1] = a_expr
+            push!(a_blocks, block)
+            b_exprs[start_idx] = b_expr
+
+        elseif group_type == :markov_chain
+            # Process entire Markov chain
+            chain = details
+            chain_indices = [idx for (idx, _) in chain]
+            chain_states = [state for (_, state) in chain]
+            n_chain = length(chain_states)
+
+            # Build Q matrix symbolically
+            Q_matrix = Matrix{ModelingToolkit.Num}(undef, n_chain, n_chain)
+            fill!(Q_matrix, ModelingToolkit.Num(0))
+            b_chain = Vector{ModelingToolkit.Num}(undef, n_chain)
+            fill!(b_chain, ModelingToolkit.Num(0))
+
+            for (i, state_i) in enumerate(chain_states)
+                # Find equation for this state
+                eq = find_equation_for_variable(eqs, state_i, sys)
+                if eq === nothing
+                    error("Could not find equation for Markov state $state_i")
+                end
+
+                rhs = substitute_observed_recursive(eq.rhs, obs_subs)
+
+                # Extract coefficients of each state variable from the linear expression
+                for (j, state_j) in enumerate(chain_states)
+                    coeff = extract_coefficient(rhs, state_j)
+                    Q_matrix[i, j] = simplify ? ModelingToolkit.Symbolics.simplify(coeff) : coeff
+                end
+
+                # b is the constant term
+                b_const = extract_constant_term(rhs, chain_states)
+                b_chain[i] = b_const
+            end
+
+            # Add Q matrix as a block
+            push!(a_blocks, Q_matrix)
+
+            # Add b vector for this chain
+            for (i, chain_state_idx) in enumerate(chain_indices)
+                b_exprs[chain_state_idx] = b_chain[i]
+            end
+
+        elseif group_type == :non_gating
+            state = details
+            # Process non-gating variable
+            eq = find_equation_for_variable(eqs, state, sys)
+            if eq === nothing
+                error("Could not find equation for non-gating variable $state")
+            end
+
+            # Add a 1×1 zero block to a matrix
+            zero_block = Matrix{ModelingToolkit.Num}(undef, 1, 1)
+            zero_block[1, 1] = ModelingToolkit.Num(0)
+            push!(a_blocks, zero_block)
+
+            # The full RHS goes into b
+            rhs = substitute_observed_recursive(eq.rhs, obs_subs)
+            b_exprs[start_idx] = simplify ? ModelingToolkit.Symbolics.simplify(rhs) : rhs
+        end
+    end
+
+    # Build functions using Symbolics.build_function
+    if isempty(a_blocks)
+        error("No gating variables found")
+    end
+
+    # Build functions for each block separately (build_function doesn't handle BlockDiagonal)
+    block_funcs = []
+    for block in a_blocks
+        # Convert each block (Matrix{Num}) to its array elements for build_function
+        func_expr = ModelingToolkit.Symbolics.build_function(
+            block,
+            states,
+            params,
+            iv,
+            expression=Val{false},
+            cse=cse
+        )[1]  # out-of-place version
+        push!(block_funcs, func_expr)
+    end
+
+    # Create a wrapper function that reconstructs BlockDiagonal from evaluated blocks
+    function a_func(u, p, t)
+        evaluated_blocks = [f(u, p, t) for f in block_funcs]
+        # Convert to properly typed vector for BlockDiagonal constructor
+        # Always use Float64 to ensure type consistency across all blocks
+        if !isempty(evaluated_blocks)
+            typed_blocks = Matrix{Float64}[Matrix{Float64}(b) for b in evaluated_blocks]
+            return BlockDiagonal(typed_blocks)
+        else
+            error("No blocks to construct BlockDiagonal")
+        end
+    end
+
+    # Build b_func - returns full state vector
+    b_func = ModelingToolkit.Symbolics.build_function(
+        [b_exprs...],
+        states,
+        params,
+        iv,
+        expression=Val{false},
+        cse=cse
+    )[1]  # out-of-place version
+
+    return RushLarsenSolvers.GRLFunction(a_func, b_func)
+end
+
+"""
+    extract_coefficient(expr, var)
+
+Extract the coefficient of `var` in a linear symbolic expression using Symbolics.coeff.
+
+For example, if expr = 2*x + 3*y - x, then:
+- extract_coefficient(expr, x) = 1
+- extract_coefficient(expr, y) = 3
+"""
+function extract_coefficient(expr, var)
+    # Use Symbolics.coeff to extract the coefficient
+    # This is the proper way to get coefficients from symbolic expressions
+    return ModelingToolkit.Symbolics.coeff(expr, var)
+end
+
+"""
+    extract_constant_term(expr, vars)
+
+Extract the constant term (independent of vars) from a symbolic expression.
+"""
+function extract_constant_term(expr, vars)
+    # Substitute all variables with 0
+    subs_dict = Dict(v => 0 for v in vars)
+    constant = ModelingToolkit.substitute(expr, subs_dict)
+    return constant
 end
 
 """

@@ -4,22 +4,34 @@ version = "0.1.0"
 authors = ["jClugstor <jadonclugston@gmail.com> and contributors"]
 
 [deps]
+BlockDiagonals = "0a1fb500-61f7-11e9-3c65-f5ef3456f9f0"
 ConcreteStructs = "2569d6c7-a4a2-43d3-a901-331e8e4be471"
 DiffEqBase = "2b5f629d-d688-5b77-993f-72d75c75574e"
+ExponentialUtilities = "d4d017d3-3776-5f7e-afef-a10c40355c18"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
-OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
 MuladdMacro = "46d2c3a1-f734-5fdb-9937-b9b9aeba4221"
+OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
 Parameters = "d96e819e-fc66-5662-9728-84c9c7592b0a"
 Reexport = "189a3867-3050-52da-a836-e630ba90ab69"
+SciMLOperators = "c0aeaf25-5076-4817-a8d5-81caf7dfa961"
+
+[weakdeps]
+ModelingToolkit = "961ee093-0014-501f-94e3-6117800e7a78"
+
+[extensions]
+RushLarsenSolversModelingToolkitExt = "ModelingToolkit"
 
 [compat]
+BlockDiagonals = "0.2.0"
 ConcreteStructs = "0.2.3"
 DiffEqBase = "6.183.2"
+ExponentialUtilities = "1.29.0"
 LinearAlgebra = "1.6.7"
 MuladdMacro = "0.2.4"
 OrdinaryDiffEq = "6.89.0"
 Parameters = "0.12.3"
 Reexport = "1.2.2"
+SciMLOperators = "1.14.1"
 julia = "1.6.7"
 
 [extras]
@@ -27,9 +39,3 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
 test = ["Test"]
-
-[weakdeps]
-ModelingToolkit = "961ee093-0014-501f-94e3-6117800e7a78"
-
-[extensions]
-RushLarsenSolversModelingToolkitExt = "ModelingToolkit"
