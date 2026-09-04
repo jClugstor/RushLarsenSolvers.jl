@@ -24,16 +24,16 @@ RushLarsenSolversModelingToolkitExt = "ModelingToolkit"
 [compat]
 BlockDiagonals = "0.2.0"
 ConcreteStructs = "0.2.3"
-DiffEqBase = "6.183.2"
+DiffEqBase = "6.183.2, 7.5"
 ExponentialUtilities = "1.29.0"
 LinearAlgebra = "1.6.7"
+ModelingToolkit = "11.26.8"
 MuladdMacro = "0.2.4"
-OrdinaryDiffEq = "6.89.0"
-Parameters = "0.12.3"
+OrdinaryDiffEq = "6.89.0, 7.0"
+Parameters = "0.12.3, 0.13"
 Reexport = "1.2.2"
 SciMLOperators = "1.14.1"
 julia = "1.6.7"
-
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
